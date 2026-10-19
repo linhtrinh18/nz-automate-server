@@ -1,0 +1,2749 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+import { StopRequested } from "../lib/execution-controller";
+import type { ExecutionHooks, ExecutionEvent } from "../lib/execution-state";
+import type { RunInput } from "../lib/run-config";
+import { automatedSection } from "./section-policy";
+import { requestedSections } from "../lib/run-plan";
+import { readFile, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+import { By, Key, until, error as webdriverError } from "selenium-webdriver";
+import { z } from "zod";
+
+import { findCountry, matchTile, type CountryTile } from "../lib/countries";
+import { WorkingHolidayStop, SavedValueVerificationError, SectionPostbackTimeoutError } from "./errors";
+import { scenarioData, validateData } from "./data-validation";
+export { scenarioData, validateData } from "./data-validation";
+export { WorkingHolidayStop } from "./errors";
+import { chooseBrowser } from "../browser/chooseBrowser";
+import {
+  DOWNGRADE_PHASE_MESSAGE, PipelineAbort, SECTION_FAILED_DETAIL, SKIPPED_DETAIL, TabScheduler, pipelineSnapshot, runPipelinedSections,
+  type PipelineRunResult, type SectionTab, type TabOps,
+} from "./tab-pipeline";
+import { windowSizedAtLaunch } from "../browser/window-size";
+
+import { AUTH_STATE_JS, readAuthState } from "./auth-state";
+import { applicationDataSchema as dataSchema } from "./application-data";
+import {
+  ACCESS_DENIED_DISABLED_MESSAGE, ACCESS_DENIED_GIVE_UP_MESSAGE, ACCESS_DENIED_LOG_PATH, AccessDeniedError, SITE_STATE_JS,
+  abortableBackoff, assertSiteAvailable, isAccessDenied, SiteBusyError,
+} from "./site-busy";
+import { occupationLookups, steps } from "./fields";
+import type { OccupationLookup } from "./fields";
+import { lookupTimeoutMs, pickResult, queryPlan } from "./occupation-match";
+import { applicable } from "./conditions";
+import { expectedFieldValue, savedValueDiagnostic } from "./saved-values";
+import { buildPageProbeScript, classifyPage, parsePageProbe, type PageProbe, type PageState } from "./page-state";
+import { loadCapSolverKey } from "../server/cloud";
+import { solveRecaptchaV2 as solveTwoCaptcha, TwoCaptchaError, formatDuration } from "./two-captcha";
+import { quiet } from "../lib/log-stamp";
+import { solveAutoCaptcha, AutoCaptchaError } from "./autocaptcha";
+import { loadTwoCaptchaKey, loadAutoCaptchaKey } from "../server/cloud";
+import { solveRecaptchaV2, CapSolverError } from "./capsolver";
+import { readCaptchaChallenge, applyCaptchaToken, clearCaptchaToken, type CaptchaChallenge } from "./capsolver-browser";
+import { finishApplication, type ApplicationResult } from "./submission";
+import {
+  ACCESS_DENIED_BACKOFF_MS, DEPENDENT_FIELD_TIMEOUT_MS, EARLY_FIELD_WAIT_MS, EARLY_SECTION_WAIT_MS, FAST_POLL_MS, FIELD_WAIT_SLICE_MS,
+  MAX_ACCESS_DENIED_RECOVERIES, MAX_FIELD_RESUMES, PAGE_POLL_MS, POSTBACK_WAIT_MS, PRE_SAVE_SETTLE_WAIT_MS, READY_WAIT_MS,
+  REMOTE_TRIGGER_FN, SECTION_WAIT_MS, SELECT2_RESULTS_WAIT_MS, SETTLE_STABLE_POLLS, SUBMISSION_CHANGE_WAIT_MS,
+  accessDeniedRecoveryEnabled, addFilled, documentComplete, earlyFillEnabled, fastFillEnabled, fieldAvailable, fieldPresent, fillSegment,
+  isDisplayedAtomSource, isNavigationError, planSection, readFieldValues, readLoadGap, readSettleState,
+  readTimeOrigin, sectionDomReady, waitForChangeThenLoad, waitForFieldInPage, type FillEntry, type SegmentResult,
+} from "./fast-fill";
+interface AutomationActionResult extends ApplicationResult {
+  driver: WebDriver;
+}
+import type { WebDriver, WebElement } from "selenium-webdriver";
+import type { FieldDefinition } from "./fields";
+import type { ApplicationData, SectionName } from "./application-data";
+import type { Driver } from "selenium-webdriver/chrome";
+
+let origin = "https://onlineservices.immigration.govt.nz";
+let home = `${origin}/WorkingHoliday/`;
+/** Test only: point the country step at a local fixture (127.0.0.1 only). */
+export function setFixtureOriginForTest(url: string): void {
+  if (!/^http:\/\/127\.0\.0\.1:\d+$/.test(url)) throw new Error("fixture origin must be 127.0.0.1");
+  origin = url;
+  home = `${origin}/WorkingHoliday/`;
+}
+const login = `${origin}/secure/Login+Working+Holiday.htm`;
+const directory = dirname(fileURLToPath(import.meta.url));
+const reportDirectory = process.env.NZWH_REPORT_DIR ?? directory;
+
+const execution = new AsyncLocalStorage<{
+  hooks?: ExecutionHooks;
+  /** Per-section "a SAVE may have been sent" flag; sections can be in flight in two tabs at once. */
+  riskBySection: Map<string, boolean>;
+  /** Foreground section: events without an explicit section belong to it. */
+  currentSection?: string;
+  /** True while the tab pipeline is active: keyed events must name their section. */
+  pipelineActive?: boolean;
+  /** Pipeline: called when a CAPTCHA was solved while the pipeline is active. */
+  onChallenge?: () => void;
+  /** Credential validation started at a section boundary, awaited right before that section's own SAVE. */
+  validations: Map<string, Promise<void>>;
+  captchaMode?: "manual" | "capsolver" | "2captcha" | "autocaptcha";
+  loadCapSolverKey?: (signal?: AbortSignal) => Promise<string | null>;
+  signal?: AbortSignal;
+  credentials?: { username: string; password: string };
+}>();
+let runStartMs = Date.now();
+const sectionMarks = new Map<string, number>();
+const newStore = () => ({ riskBySection: new Map<string, boolean>(), validations: new Map<string, Promise<void>>() });
+/** True when a SAVE for this section may have reached the server. */
+function sectionRisk(name: string | undefined): boolean {
+  return execution.getStore()?.riskBySection.get(name ?? "") ?? false;
+}
+async function emit(event: ExecutionEvent): Promise<void> {
+  const context = execution.getStore();
+  let routed = event;
+  if (event.type === "section-start") {
+    sectionMarks.set(event.section, Date.now());
+    if (context && !context.pipelineActive) context.currentSection = event.section;
+    console.log(`[NZWH] Section ${event.section} started.`);
+  } else if (event.type === "persistence" || event.type === "section-result" || event.type === "captcha") {
+    const section = event.section ?? context?.currentSection;
+    if (context?.pipelineActive) {
+      // Background steps must name their section; foreground code is keyed by the foreground section.
+      if (!event.section && event.background) {
+        console.error("[NZWH] Pipeline event without a section was dropped.");
+        return;
+      }
+      if (!event.section && section) routed = { ...event, section: section as SectionName };
+    }
+    if (event.type === "section-result") {
+      const started = section ? sectionMarks.get(section) : undefined;
+      if (section && started !== undefined) {
+        console.log(`[NZWH] Section ${section} ${event.status} in ${formatDuration(Date.now() - started)}.`);
+        sectionMarks.delete(section);
+      }
+    }
+    if (context && event.type === "persistence" && event.state !== "verified")
+      context.riskBySection.set(section ?? "", true);
+  }
+  await context?.hooks?.event(routed);
+}
+/** Test only: run fn with execution hooks so emitted events can be observed. */
+export function withHooksForTest<T>(hooks: ExecutionHooks, fn: () => Promise<T>, options: { captchaMode?: "manual" | "capsolver" | "2captcha" | "autocaptcha"; signal?: AbortSignal; loadCapSolverKey?: (signal?: AbortSignal) => Promise<string | null> } = {}): Promise<T> {
+  return execution.run({ hooks, ...newStore(), ...options }, fn);
+}
+async function checkpoint(): Promise<void> {
+  await execution.getStore()?.hooks?.checkpoint();
+}
+/** Errors from a credential validation that overlapped a section; they stop the run exactly as checkpoint() did. */
+const validationFailures = new WeakSet<object>();
+/**
+ * E1: section boundary. With scheduler hooks the credential validation starts now and is awaited right before the
+ * section's own CAPTCHA/SAVE; without them this is today's checkpoint().
+ */
+async function sectionBoundary(name: string, prefetch = false): Promise<"continue" | "pause" | "stop"> {
+  const context = execution.getStore();
+  if (!context?.hooks?.boundary) {
+    await checkpoint();
+    return "continue";
+  }
+  const result = await context.hooks.boundary({ prefetch });
+  if (result.command === "continue" && result.validated) {
+    result.validated.catch((error: unknown) => { if (typeof error === "object" && error) validationFailures.add(error); });
+    context.validations.set(name, result.validated);
+  }
+  return result.command;
+}
+class SessionExpiredError extends WorkingHolidayStop {}
+const loginRejectedMessage =
+  "Login rejected: incorrect credentials or account locked. No automatic retry. Check the assigned NZWH credentials and resolve account access manually before restarting.";
+
+async function requireSession(driver: WebDriver): Promise<void> {
+  const state = await readAuthState(driver);
+  if (state.rejected) throw new WorkingHolidayStop(loginRejectedMessage);
+  if (state.loginForm)
+    throw new SessionExpiredError(
+      "The form redirected to login; session is no longer authenticated.",
+    );
+}
+
+
+export interface WorkingHolidayOptions {
+  mode?: RunInput["mode"];
+  payerName?: string;
+  credentials?: { username: string; password: string };
+  dataPath: string;
+  expectedApplicationId?: string;
+  sections?: SectionName[];
+  taskKeys?: string[];
+  hooks?: ExecutionHooks;
+  signal?: AbortSignal;
+  captchaMode?: "manual" | "capsolver" | "2captcha" | "autocaptcha";
+  attachPort?: number;
+  scenario?: string;
+  allowFictionalDraftSave?: boolean;
+  browserType?: "visible" | "profile";
+  headless?: boolean;
+  profileName?: string;
+  useDefaultAgent?: boolean;
+  country?: string;
+}
+
+const CAPTCHA_PENDING_JS = `
+    const challengePage = /captcha/i.test(location.pathname) || /please complete the captcha/i.test(document.body?.innerText || '');
+    const widgets = Array.from(document.querySelectorAll('iframe[src*="recaptcha"],iframe[src*="hcaptcha"],input[id*="captcha"],img[src*="captcha"]'))
+      .some(e => e.getBoundingClientRect().width > 0 && e.getBoundingClientRect().height > 0);
+    const completed = Array.from(document.querySelectorAll('textarea[name="g-recaptcha-response"],textarea[name="h-captcha-response"],input[name="h-captcha-response"]')).some(e => e.value.trim().length > 0);
+    return challengePage || (widgets && !completed);
+  `;
+export async function captchaPending(driver: WebDriver): Promise<boolean> {
+  return driver.executeScript<boolean>(CAPTCHA_PENDING_JS);
+}
+/** E2: one round trip for site state + CAPTCHA + auth (local names renamed so single-purpose script matchers ignore it). */
+const PAGE_PROBE_JS = buildPageProbeScript({ site: SITE_STATE_JS, captcha: CAPTCHA_PENDING_JS.replaceAll("challengePage", "probeChallenge"), auth: AUTH_STATE_JS });
+async function readPageProbe(driver: WebDriver): Promise<PageProbe | null> {
+  return parsePageProbe(await driver.executeScript<unknown>(PAGE_PROBE_JS));
+}
+
+/** Only the dedicated CAPTCHA form may be submitted after a response is present. */
+export async function captchaSubmitCandidate(driver: WebDriver): Promise<{
+  button: WebElement;
+  completionId: string;
+} | null> {
+  return driver.executeScript(`
+    const captchaSubmit = true;
+    const captchaPath = path => /\\/(?:[a-z0-9_-]*captcha[a-z0-9_-]*)(?:\\.(?:aspx|html?))?$/i.test(path);
+    if (location.origin !== arguments[0] || !captchaPath(location.pathname)) return null;
+    const visible = e => e.getBoundingClientRect().width > 0 && e.getBoundingClientRect().height > 0;
+    const responses = Array.from(document.querySelectorAll('textarea[name="g-recaptcha-response"],textarea[name="h-captcha-response"],input[name="h-captcha-response"]'))
+      .filter(e => e.value.trim());
+    if (!responses.length) return null;
+    const buttons = Array.from(document.querySelectorAll('input[type="submit"],button[type="submit"],button:not([type])')).filter(e => {
+      if (e.disabled || !visible(e) || !/^submit$/i.test((e.value || e.textContent || '').trim())) return false;
+      const form = e.form;
+      if (!form || !responses.some(response => response.form === form)) return false;
+      const destination = new URL(e.getAttribute('formaction') || form.getAttribute('action') || location.href, location.href);
+      return destination.origin === location.origin && captchaPath(destination.pathname);
+    });
+    if (buttons.length !== 1) return null;
+    // One click per completed response; never log the response token.
+    let hash = 2166136261;
+    for (const character of responses.map(e => e.value).join('|')) hash = Math.imul(hash ^ character.charCodeAt(0), 16777619) >>> 0;
+    return { button: buttons[0], completionId: String(performance.timeOrigin) + ':' + hash };
+  `, origin);
+}
+
+/** Drivers whose session may use the eager page-load strategy (set only by executeWorkingHoliday). */
+const eagerDrivers = new WeakSet<WebDriver>();
+/** Test only: treat a fake driver as an eager session. */
+export const markEagerDriverForTest = (driver: WebDriver): void => { eagerDrivers.add(driver); };
+/** Test only: was this driver registered as a possibly-eager session? */
+export const isEagerDriverForTest = (driver: WebDriver): boolean => eagerDrivers.has(driver);
+
+/** Human CAPTCHA wait limit: NZWH_CAPTCHA_TIMEOUT_MINUTES (1-240, default 30). */
+export function captchaTimeoutMinutes(): number {
+  const raw = Number(process.env.NZWH_CAPTCHA_TIMEOUT_MINUTES);
+  return Number.isInteger(raw) && raw >= 1 && raw <= 240 ? raw : 30;
+}
+export async function captchaGuard(driver: WebDriver): Promise<boolean> {
+  const context = execution.getStore();
+  const checkCancelled = () => { if (context?.signal?.aborted) throw new StopRequested(); };
+  checkCancelled();
+  await assertSiteAvailable(driver);
+  if (!(await captchaPending(driver))) return false;
+  const notify = async (message: string) => {
+    await emit({ type: "captcha", waiting: true, message });
+    console.log(`[NZWH] ${message}`);
+  };
+  const captchaStartedAt = Date.now();
+  const since = () => formatDuration(Date.now() - captchaStartedAt);
+  const trace = (message: string) => console.log(`[NZWH] CAPTCHA +${since()}: ${message}`);
+  const providerName = ({ capsolver: "CapSolver", "2captcha": "2Captcha", autocaptcha: "AutoCaptcha" } as const)[context?.captchaMode as "capsolver" | "2captcha" | "autocaptcha"] ?? "CapSolver";
+  const manual = "Giải CAPTCHA trong Chrome; tác vụ tự tiếp tục. Chỉ nút Submit riêng của CAPTCHA được tự bấm khi có phản hồi.";
+  if (typeof (driver as Driver).sendDevToolsCommand === "function")
+    await activateChrome(driver).catch(() => undefined);
+  const submitted = new Set<string>();
+  const attempt = new AbortController();
+  const signal = context?.signal ? AbortSignal.any([attempt.signal, context.signal]) : attempt.signal;
+  let result: { token: string } | { error: unknown } | undefined;
+  let pending: Promise<void> | undefined;
+  let challenge: CaptchaChallenge | null = null;
+  let applied: { token: string; at: number } | undefined;
+  let completed = false;
+  let solvedAt: number | undefined;
+  try {
+    if (context?.captchaMode === "capsolver" || context?.captchaMode === "2captcha" || context?.captchaMode === "autocaptcha") {
+      let skipProvider = false;
+      if (eagerDrivers.has(driver)) {
+        // Eager no longer guarantees load; the challenge iframe may not exist yet. Normally just the load tail.
+        const loadDeadline = Date.now() + READY_WAIT_MS;
+        while (Date.now() < loadDeadline) {
+          if (await driver.executeScript<boolean>("return document.readyState === 'complete'")) break;
+          checkCancelled();
+          await assertSiteAvailable(driver);
+          if (!(await captchaPending(driver))) { skipProvider = true; break; }
+          await new Promise(resolve => setTimeout(resolve, PAGE_POLL_MS));
+        }
+        if (!skipProvider && !(await captchaPending(driver))) skipProvider = true;
+        if (skipProvider) trace("challenge gone during load wait.");
+      }
+      if (!skipProvider) {
+        challenge = await readCaptchaChallenge(driver, origin);
+        checkCancelled();
+        trace(`mode=${context.captchaMode}; page=${challenge ? new URL(challenge.websiteURL).pathname : "n/a"}; challenge ${challenge ? "supported (reCAPTCHA v2)" : "unsupported (no usable reCAPTCHA v2 sitekey found)"}.`);
+        let key: string | null = null;
+        let configurationUnavailable = false;
+        if (challenge) {
+          await notify(`Đang đọc cấu hình ${providerName}; bạn vẫn có thể giải CAPTCHA trong Chrome.`);
+          try {
+            key = await (context.captchaMode === "autocaptcha" ? loadAutoCaptchaKey : context.captchaMode === "2captcha" ? loadTwoCaptchaKey : context.loadCapSolverKey ?? loadCapSolverKey)(signal);
+          } catch {
+            checkCancelled();
+            configurationUnavailable = true;
+          }
+          checkCancelled();
+          trace(configurationUnavailable ? "key load failed; manual fallback." : `key loaded from app: ${key ? `yes (length ${key.length})` : "no"}.`);
+        }
+        if (key && challenge) {
+          await notify(`Đang thử ${providerName} (reCAPTCHA v2). Bạn vẫn có thể giải trong Chrome; lỗi sẽ chuyển sang thủ công.`);
+          const request = { websiteURL: challenge.websiteURL, websiteKey: challenge.websiteKey };
+          pending = (context.captchaMode === "autocaptcha" ? solveAutoCaptcha(request, key, signal, trace) : context.captchaMode === "2captcha" ? solveTwoCaptcha(request, key, signal, trace) : solveRecaptchaV2(request, key, signal))
+            .then(token => { result = { token }; solvedAt = Date.now(); trace(`${providerName} ready; token length ${token.length}.`); }, error => { result = { error }; });
+        } else {
+          await notify(`${!challenge ? "Chưa hỗ trợ cấu hình CAPTCHA này." : configurationUnavailable ? `Không đọc được cấu hình ${providerName}; nhờ quản trị viên kiểm tra.` : context.captchaMode === "autocaptcha" ? "Chưa có khóa AutoCaptcha dùng chung; nhờ quản trị viên cấu hình trong /admin/autocaptcha." : context.captchaMode === "2captcha" ? "Chưa có khóa 2Captcha dùng chung; nhờ quản trị viên cấu hình trong /admin/2captcha." : "Chưa có khóa CapSolver dùng chung; nhờ quản trị viên cấu hình trong /admin."} ${manual}`);
+        }
+      }
+    } else await notify(manual);
+    await driver.wait(
+      async () => {
+        checkCancelled();
+        await assertSiteAvailable(driver);
+        // A human completion always wins over a pending or late provider result.
+        const candidate = await captchaSubmitCandidate(driver);
+        if (candidate && !submitted.has(candidate.completionId)) {
+          attempt.abort();
+          result = undefined;
+          submitted.add(candidate.completionId);
+          try {
+            checkCancelled();
+            await candidate.button.click();
+            console.log("[NZWH] CAPTCHA-only Submit clicked; waiting for acceptance.");
+            trace("CAPTCHA-only Submit clicked; waiting for page acceptance.");
+          } catch (error) {
+            if (!(error instanceof webdriverError.StaleElementReferenceError) &&
+                !(error instanceof webdriverError.NoSuchElementError)) throw error;
+          }
+          return false;
+        }
+        if (!(await captchaPending(driver))) {
+          attempt.abort();
+          return driver.executeScript<boolean>("return document.readyState === 'complete'");
+        }
+        if (result && !attempt.signal.aborted) {
+          const resolved = result;
+          result = undefined;
+          checkCancelled();
+          if ("token" in resolved && challenge) {
+            const accepted = await applyCaptchaToken(driver, origin, challenge, resolved.token);
+            if (accepted) {
+              applied = { token: resolved.token, at: Date.now() };
+              trace(`token injected (length ${resolved.token.length}); waiting for page acceptance.`);
+              await notify(`Đã nhận phản hồi ${providerName}; đang chờ trang đích xác nhận CAPTCHA.`);
+            } else {
+              attempt.abort();
+              trace("page or challenge changed; token discarded; manual fallback.");
+              await notify(`Trang hoặc CAPTCHA đã thay đổi; bỏ phản hồi ${providerName}. ${manual}`);
+            }
+          } else {
+            attempt.abort();
+            const reason = "error" in resolved && (resolved.error instanceof CapSolverError || resolved.error instanceof TwoCaptchaError || resolved.error instanceof AutoCaptchaError) ? resolved.error.category : "service";
+            const hints: Record<string, string> = {
+              balance: "Tài khoản hết số dư.",
+              auth: "API key không hợp lệ hoặc bị khóa.",
+              ip: "IP không được phép hoặc bị chặn.",
+              unsolvable: "Không giải được CAPTCHA.",
+              busy: "Dịch vụ đang quá tải; thử lại sau ít giây.",
+              proxy: "Proxy không dùng được.",
+            };
+            const twoCaptchaError = "error" in resolved && resolved.error instanceof TwoCaptchaError ? resolved.error : undefined;
+            const hint = twoCaptchaError && reason in hints ? ` ${hints[reason]}` : "";
+            const code = twoCaptchaError?.providerCode ? `, ${twoCaptchaError.providerCode}` : "";
+            trace(`${providerName} failed: category=${reason}${twoCaptchaError?.providerCode ? ` providerCode=${twoCaptchaError.providerCode}` : ""}; manual fallback.`);
+            await notify(`${providerName} không hoàn tất (${reason}${code}).${hint} ${manual}`);
+          }
+        }
+        if (applied && challenge && Date.now() - applied.at >= 10000) {
+          await clearCaptchaToken(driver, origin, challenge, applied.token);
+          applied = undefined;
+          trace("page did not accept the token within 10s; token cleared; manual fallback.");
+          await notify(`Trang chưa chấp nhận phản hồi ${providerName}; không tự thử lại. Tải lại trang CAPTCHA nếu ô vẫn được chọn. ${manual}`);
+        }
+        return false;
+      },
+      captchaTimeoutMinutes() * 60 * 1000,
+      "CAPTCHA waiting expired",
+      200,
+    );
+    completed = true;
+  } catch (error) {
+    if (!(error instanceof webdriverError.TimeoutError)) throw error;
+    throw new WorkingHolidayStop(
+      `CAPTCHA was not completed within ${captchaTimeoutMinutes()} minutes; stopped without bypassing it.`,
+    );
+  } finally {
+    attempt.abort();
+    await pending;
+    await emit({ type: "captcha", waiting: false,
+      ...(!completed ? { message: "Đã kết thúc chờ CAPTCHA; chưa xác nhận hoàn tất." } : {}),
+    });
+  }
+  if (solvedAt && applied) {
+    trace(`summary: solved by ${providerName} in ${formatDuration(solvedAt - captchaStartedAt)}, accepted ${formatDuration(Date.now() - applied.at)} after injection, total ${since()}.`);
+  } else trace(`summary: completed manually/without provider token, total ${since()}.`);
+  context?.onChallenge?.();
+  console.log(
+    `[NZWH] CAPTCHA completion detected after ${Math.round((Date.now() - captchaStartedAt) / 1000)}s. Resuming automatically.`,
+  );
+  return true;
+}
+
+/** CAPTCHA time must not consume the surrounding page/postback timeout. */
+export async function waitWithCaptcha<T>(
+  driver: WebDriver,
+  condition: () => Promise<T>,
+  timeout: number,
+  pollMs = PAGE_POLL_MS,
+  between?: () => Promise<void>,
+): Promise<NonNullable<T>> {
+  let deadline = Date.now() + timeout;
+  while (true) {
+    const before = Date.now();
+    // Common case: one probe says the page is available and has no CAPTCHA; otherwise the full guard decides.
+    const probe = await readPageProbe(driver);
+    if (probe && !probe.site && !probe.captcha) checkCancelled();
+    else if (await captchaGuard(driver)) deadline += Date.now() - before;
+    const value = await condition();
+    if (value) return value as NonNullable<T>;
+    if (Date.now() >= deadline)
+      throw new webdriverError.TimeoutError("Page condition did not become ready.");
+    // Pipeline: background tabs advance one cheap step while this tab waits.
+    await between?.();
+    await new Promise(resolve => setTimeout(resolve, pollMs));
+  }
+}
+
+async function ready(driver: WebDriver, pollMs = PAGE_POLL_MS): Promise<void> {
+  await waitWithCaptcha(driver,
+    async () =>
+      (await driver.executeScript<string>("return document.readyState")) ===
+      "complete",
+    READY_WAIT_MS,
+    pollMs,
+  );
+}
+
+/** Stop/cancel check for the fast-fill loops (captchaGuard keeps its own). */
+function checkCancelled(): void {
+  if (execution.getStore()?.signal?.aborted) throw new StopRequested();
+}
+
+function assertHost(url: string): void {
+  if (new URL(url).origin !== origin)
+    throw new WorkingHolidayStop("Stopped at an unexpected destination.");
+}
+
+async function navigate(driver: WebDriver, url: string): Promise<void> {
+  try {
+    await driver.get(url);
+  } catch (error) {
+    if (!(error instanceof Error) || error.name !== "TimeoutError") throw error;
+    const actual = new URL(await driver.getCurrentUrl());
+    const requested = new URL(url);
+    const loaded = await driver.executeScript<boolean>(
+      "return document.readyState === 'complete'",
+    );
+    // Chrome can time out on a background resource after the destination's DOM
+    // has completed. Keep normal CAPTCHA/session/page identity checks in callers.
+    if (actual.origin !== requested.origin || !loaded) throw error;
+    const recognized = await driver.executeScript<boolean>(`
+      return !!document.querySelector('input[name="username"],a[id*="editHyperLink"],input[id^="ContentPlaceHolder1_"]')
+        || /captcha/i.test(location.pathname) || /site busy|please try again later/i.test(document.title + ' ' + document.body.innerText);
+    `);
+    if (!recognized) throw error;
+    console.log(
+      "[NZWH] Navigation timed out on a background resource, but the same-origin application page is fully loaded. Continuing with page verification.",
+    );
+  }
+}
+
+const HOME_LANDMARKS = 'a[href*="Logout"],a[href*="Login"],input[name="username"],a[id*="editHyperLink"],a[href*="CountryId="]';
+/** Waits for any landmark of the page that follows a navigation, or full load, whichever comes first (legacy: full load). */
+async function settleNavigation(driver: WebDriver, landmarks: string): Promise<void> {
+  if (!earlyFillEnabled()) return ready(driver);
+  await waitWithCaptcha(driver, async () =>
+    (await driver.findElements(By.css(landmarks))).length > 0 ||
+    (await driver.executeScript<string>("return document.readyState")) === "complete",
+  READY_WAIT_MS, FAST_POLL_MS);
+}
+async function authenticate(
+  driver: WebDriver,
+  acceptCountryGrid = false,
+  assigned?: { username: string; password: string },
+  loginOnly = false,
+): Promise<void> {
+  assigned ??= execution.getStore()?.credentials;
+  const credentials = z
+    .object({
+      NZWH_USERNAME: z.string().min(1),
+      NZWH_PASSWORD: z.string().min(1),
+    })
+    .safeParse(assigned ? { NZWH_USERNAME: assigned.username, NZWH_PASSWORD: assigned.password } : process.env);
+  if (!credentials.success)
+    throw new WorkingHolidayStop(
+      "Set NZWH_USERNAME and NZWH_PASSWORD in your environment.",
+    );
+  console.log(
+    "[NZWH] Starting a fresh login before opening any applicant fields.",
+  );
+  // E4: targeted waits replace the blanket load wait; NZWH_EARLY_FILL=0 keeps the legacy ready() calls.
+  const quick = earlyFillEnabled();
+  await navigate(driver, home);
+  await settleNavigation(driver, HOME_LANDMARKS);
+  const logoutLinks = await driver.findElements(By.css('a[href*="Logout"]'));
+  if (logoutLinks.length) {
+    const logoutUrl = await logoutLinks[0].getAttribute("href");
+    if (!logoutUrl)
+      throw new WorkingHolidayStop("Logout link is missing its destination.");
+    assertHost(logoutUrl);
+    await navigate(driver, logoutUrl);
+    if (!quick) await ready(driver);
+    console.log("[NZWH] Previous session signed out.");
+  }
+  await navigate(driver, login);
+  if (!quick) await ready(driver);
+  await waitWithCaptcha(driver, async () => {
+    return (
+      (await driver.findElements(By.css('input[name="username"]'))).length === 1
+    );
+  }, 20000);
+  assertHost(await driver.getCurrentUrl());
+  // Never log credential values, Selenium exceptions, page source or login screenshots.
+  await driver.wait(
+    until.elementLocated(By.css('input[name="username"]')),
+    15000,
+  );
+  await driver.findElement(By.css('input[name="username"]')).clear();
+  await driver.findElement(By.css('input[name="password"]')).clear();
+  await driver
+    .findElement(By.css('input[name="username"]'))
+    .sendKeys(credentials.data.NZWH_USERNAME);
+  await driver
+    .findElement(By.css('input[name="password"]'))
+    .sendKeys(credentials.data.NZWH_PASSWORD);
+  await captchaGuard(driver);
+  await driver
+    .findElement(By.css('input[type="submit"][value="LOGIN"]'))
+    .click();
+  console.log(
+    `[NZWH] Login submitted; waiting for authenticated page. url=${await driver.getCurrentUrl().then((u) => new URL(u).pathname).catch(() => "?")}`,
+  );
+  await waitWithCaptcha(driver, async () => {
+    const state = await readAuthState(driver);
+    if (state.rejected) throw new WorkingHolidayStop(loginRejectedMessage);
+    return state.authenticated;
+  }, 30000);
+  if (!quick || loginOnly) await ready(driver);
+  if (loginOnly) return;
+  await navigate(driver, home);
+  if (!quick) await ready(driver);
+  await waitWithCaptcha(driver,
+    async () =>
+      (await driver.findElements(By.css('a[id*="editHyperLink"]'))).length > 0 ||
+      (acceptCountryGrid && (await countryTiles(driver)).length > 0),
+    20000,
+  );
+  assertHost(await driver.getCurrentUrl());
+}
+/**
+ * Reads the country tile grid. Open tiles are anchors to Create.aspx?CountryId=...;
+ * closed tiles are grey and have no such link, so they are found by their text.
+ * Selectors were not verified against the live DOM (the site denied the automated
+ * browser), so detection is deliberately tolerant.
+ */
+async function countryTiles(driver: WebDriver): Promise<CountryTile[]> {
+  return driver.executeScript<CountryTile[]>(`
+    const tiles = [];
+    const seen = new Set();
+    for (const a of document.querySelectorAll('a[href*="CountryId="]')) {
+      const text = (a.innerText || a.textContent || '').replace(/\\s+/g, ' ').replace(/\\s*\\b(OPEN|CLOSED)\\b\\s*$/i, '').trim();
+      const cls = (a.className || '') + ' ' + (a.parentElement?.className || '');
+      const open = !/disabled|closed/i.test(cls) && a.getAttribute('aria-disabled') !== 'true';
+      tiles.push({ text, href: a.href, open });
+      seen.add(text.toLowerCase());
+    }
+    for (const e of document.querySelectorAll('div,span,li,td,p,h2,h3,h4,button')) {
+      if (Array.from(e.children).some((c) => !/^(BR|SPAN|SMALL|B|STRONG|I|EM)$/.test(c.tagName)) || e.closest('a[href*="CountryId="]')) continue;
+      const text = (e.innerText || e.textContent || '').replace(/\\s+/g, ' ').replace(/\\s*\\b(OPEN|CLOSED)\\b\\s*$/i, '').trim();
+      if (text && text.length < 40 && /^[A-Z][A-Z .'-]+$/i.test(text) && !/^(open|closed)$/i.test(text) && !seen.has(text.toLowerCase())) {
+        tiles.push({ text, href: null, open: false });
+        seen.add(text.toLowerCase());
+      }
+    }
+    return tiles;
+  `);
+}
+const countryPollMs = 15000;
+const countryDeadlineMs = 30 * 60 * 1000;
+/** Clicks the chosen country's tile and stops on Create.aspx. Never submits anything. */
+export async function selectCountry(driver: WebDriver, code: string): Promise<void> {
+  const country = findCountry(code);
+  if (!country) throw new WorkingHolidayStop("Quốc gia không được hỗ trợ.");
+  const deadline = Date.now() + countryDeadlineMs;
+  let lastReport = 0;
+  while (true) {
+    await checkpoint();
+    await requireSession(driver);
+    if (!new URL(await driver.getCurrentUrl()).pathname.match(/^\/WorkingHoliday\/?$/i)) {
+      await navigate(driver, home);
+      if (!earlyFillEnabled()) await ready(driver);
+    }
+    await waitWithCaptcha(driver, async () => (await countryTiles(driver)).length > 0, 20000);
+    const tile = matchTile(await countryTiles(driver), country);
+    if (!tile)
+      throw new WorkingHolidayStop(
+        `Không tìm thấy ô quốc gia ${country.name} trên trang.`,
+      );
+    if (tile.open && tile.href) {
+      assertHost(tile.href);
+      console.log(`[NZWH] ${country.name} is OPEN. Clicking its tile.`);
+      const links = await driver.findElements(By.css('a[href*="CountryId="]'));
+      let target: WebElement | undefined;
+      for (const link of links)
+        if ((await link.getAttribute("href")) === tile.href) target = link;
+      if (!target)
+        throw new WorkingHolidayStop("Không tìm thấy liên kết của ô quốc gia.");
+      await driver.executeScript(
+        "arguments[0].scrollIntoView({block:'center'})",
+        target,
+      );
+      // E8: wait for the tile to be in view instead of a fixed 300 ms sleep; fall through to the click on timeout.
+      try {
+        await waitWithCaptcha(driver, () => driver.executeScript<boolean>(
+          "const r = arguments[0].getBoundingClientRect(); return r.bottom > 0 && r.top < window.innerHeight;", target),
+        2000, FAST_POLL_MS);
+      } catch (error) {
+        if (!(error instanceof webdriverError.TimeoutError)) throw error;
+      }
+      const original = await driver.getWindowHandle();
+      await clickWithFallback(driver, target);
+      try {
+        await waitWithCaptcha(driver, async () => {
+          const handles = await driver.getAllWindowHandles();
+          for (const h of handles) {
+            if (h === original) continue;
+            // Popup notice: close it and return to the original screen.
+            await driver.switchTo().window(h);
+            const popupUrl = await driver.getCurrentUrl();
+            if (!/Create\.aspx/i.test(popupUrl)) {
+              await driver.close();
+              await driver.switchTo().window(original);
+            }
+          }
+          const url = new URL(await driver.getCurrentUrl());
+          return (
+            /^\/WorkingHoliday\/Application\/Create\.aspx$/i.test(url.pathname) &&
+            url.searchParams.has("CountryId")
+          );
+        }, 30000);
+      } catch (error) {
+        if (!(error instanceof webdriverError.TimeoutError)) throw error;
+        throw new WorkingHolidayStop("Chọn quốc gia không chuyển trang.");
+      }
+      await ready(driver);
+      await requireSession(driver);
+      console.log(`[NZWH] Reached ${await driver.getCurrentUrl()}. Stopping before any submission.`);
+      return;
+    }
+    if (Date.now() > deadline)
+      throw new WorkingHolidayStop(
+        `${country.name} vẫn đóng sau 30 phút; đã dừng.`,
+      );
+    if (Date.now() - lastReport >= 60000) {
+      lastReport = Date.now();
+      console.log(`[NZWH] ${country.name} is CLOSED. Re-checking every ${countryPollMs / 1000}s...`);
+      await emit({
+        type: "phase",
+        phase: "login",
+        message: `${country.label} đang đóng. Hệ thống sẽ thử lại mỗi ${countryPollMs / 1000} giây.`,
+      });
+    }
+    for (let waited = 0; waited < countryPollMs; waited += 200) {
+      await checkpoint();
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    await navigate(driver, home);
+    if (!earlyFillEnabled()) await ready(driver);
+  }
+}
+
+export function currentState(driver: WebDriver): Promise<PageState> {
+  return classifyPage(driver, origin);
+}
+/** Clicks the single visible APPLY NOW control on Create.aspx. Touches nothing else. */
+export async function clickApplyNow(driver: WebDriver): Promise<"clicked" | "unavailable"> {
+  const found = await driver.executeScript<
+    { unavailable: true } | { element: WebElement } | null
+  >(`
+    const text = e => (e.value || e.innerText || e.textContent || e.alt || e.getAttribute('aria-label') || '').replace(/\\s+/g, ' ').trim();
+    const visible = e => e.getBoundingClientRect().width > 0 && e.getBoundingClientRect().height > 0;
+    const matches = Array.from(document.querySelectorAll('input[type="submit"],input[type="button"],input[type="image"],button,a,[role="button"]'))
+      .filter(e => /^apply\\s*now$/i.test(text(e)) && visible(e) && !e.disabled);
+    if (matches.length) return { element: matches[0] };
+    if (/scheme\\s+(is\\s+)?(not\\s+available|closed)/i.test(document.body?.innerText || '')) return { unavailable: true };
+    return null;
+  `);
+  if (found && "unavailable" in found) return "unavailable";
+  if (!found) throw new WorkingHolidayStop("Không tìm thấy nút APPLY NOW.");
+  await emit({ type: "phase", phase: "login", message: "Đang bấm APPLY NOW." });
+  await driver.executeScript("arguments[0].scrollIntoView({block:'center'})", found.element);
+  console.log("[NZWH] Clicking APPLY NOW.");
+  await clickWithFallback(driver, found.element);
+  try {
+    await waitWithCaptcha(driver, async () => (await currentState(driver)) !== "create", 30000);
+  } catch (error) {
+    if (!(error instanceof webdriverError.TimeoutError)) throw error;
+    throw new WorkingHolidayStop("Bấm APPLY NOW nhưng trang không chuyển.");
+  }
+  return "clicked";
+}
+/**
+ * Page state machine: home grid -> Create.aspx (APPLY NOW) -> rs-captcha (human) -> Wizard.
+ * Works from any starting page. Never fills data and never submits an application.
+ */
+export async function advanceToWizard(driver: WebDriver, code: string): Promise<void> {
+  const country = findCountry(code);
+  if (!country) throw new WorkingHolidayStop("Quốc gia không được hỗ trợ.");
+  const deadline = Date.now() + countryDeadlineMs;
+  let lastReport = 0;
+  let loggedIn = false;
+  for (let pass = 0; pass < 200; pass++) {
+    await checkpoint();
+    const state = await currentState(driver);
+    if (state === "wizard") {
+      assertHost(await driver.getCurrentUrl());
+      return;
+    }
+    if (state !== "login") await requireSession(driver);
+    if (Date.now() > deadline)
+      throw new WorkingHolidayStop(`${country.name} chưa sẵn sàng sau 30 phút; đã dừng.`);
+    if (state === "home") await selectCountry(driver, code);
+    else if (state === "captcha") await captchaGuard(driver);
+    else if (state === "create") {
+      if ((await clickApplyNow(driver)) === "unavailable") {
+        if (Date.now() - lastReport >= 60000) {
+          lastReport = Date.now();
+          console.log(`[NZWH] ${country.name} scheme is NOT available. Re-checking every ${countryPollMs / 1000}s...`);
+          await emit({
+            type: "phase",
+            phase: "login",
+            message: `${country.label} chưa mở nhận hồ sơ. Hệ thống sẽ thử lại mỗi ${countryPollMs / 1000} giây.`,
+          });
+        }
+        for (let waited = 0; waited < countryPollMs; waited += 200) {
+          await checkpoint();
+          await new Promise((resolve) => setTimeout(resolve, 200));
+        }
+        await navigate(driver, home);
+        await ready(driver);
+      }
+    } else if (state === "login") {
+      if (loggedIn) throw new WorkingHolidayStop("Đăng nhập không thành công; đã dừng.");
+      loggedIn = true;
+      await authenticate(driver, true);
+    } else {
+      await navigate(driver, home);
+      await ready(driver);
+    }
+  }
+  throw new WorkingHolidayStop("Không thể đến trang hồ sơ sau nhiều lần thử.");
+}
+async function setField(
+  driver: WebDriver,
+  field: FieldDefinition,
+  value: string,
+  element: WebElement,
+): Promise<void> {
+  if (field.kind === "select") {
+    // Select2 hides the native select; interact with its visible generated control.
+    const widgets = await driver.findElements(
+      By.css(`#s2id_${field.id} a.select2-choice`),
+    );
+    const hasWidget = widgets.length === 1 && (await widgets[0].isDisplayed());
+    if (value === "" && (await element.getAttribute("value")) === "") return;
+    if (!hasWidget) {
+      const options = await element.findElements(By.css("option"));
+      for (const option of options) {
+        if ((await option.getAttribute("value")) === value) {
+          await option.click();
+          await element.sendKeys(Key.TAB);
+          return;
+        }
+      }
+      throw new WorkingHolidayStop("Option no longer exists.");
+    }
+    if (value === "") {
+      const clear = await driver.findElements(
+        By.css(`#s2id_${field.id} .select2-search-choice-close`),
+      );
+      if (!clear.length || !(await clear[0].isDisplayed()))
+        throw new WorkingHolidayStop(
+          "This dropdown cannot be cleared through its visible widget.",
+        );
+      await clear[0].click();
+      return;
+    }
+    const label = await driver.executeScript<string>(
+      "const option = Array.from(arguments[0].options).find(o => o.value === arguments[1]); return option ? option.textContent : '';",
+      element,
+      value,
+    );
+    if (!label.trim())
+      throw new WorkingHolidayStop("Requested dropdown option is unavailable.");
+    await widgets[0].click();
+    const search = await driver.findElements(
+      By.css(".select2-drop-active .select2-input"),
+    );
+    if (search.length && (await search[0].isDisplayed()))
+      await search[0].sendKeys(label.trim());
+    await driver.wait(
+      async () =>
+        (
+          await driver.findElements(
+            By.css(".select2-drop-active .select2-result-label"),
+          )
+        ).length > 0,
+      SELECT2_RESULTS_WAIT_MS,
+    );
+    const choices = await driver.findElements(
+      By.css(".select2-drop-active .select2-result-label"),
+    );
+    for (const choice of choices) {
+      if ((await choice.getText()).trim() === label.trim()) {
+        await choice.click();
+        return;
+      }
+    }
+    throw new WorkingHolidayStop("Select2 choice requires manual review.");
+  }
+  await element.clear();
+  if (value) await element.sendKeys(value);
+  if (!field.lookup) await element.sendKeys(Key.TAB);
+}
+
+/**
+ * Page access for background tabs over raw CDP. ChromeDriver blocks every WebDriver command on a tab whose navigation is
+ * still loading, which would stall the foreground tab; Runtime.evaluate and Page.navigate do not wait.
+ * Only scripts that pass JSON-serialisable arguments may run through it (no WebElements).
+ */
+function cdpPage(driver: WebDriver): WebDriver {
+  const chromium = driver as Driver;
+  const evaluate = async <T>(script: string, args: unknown[]): Promise<T> => {
+    const out = await (chromium.sendAndGetDevToolsCommand("Runtime.evaluate", {
+      expression: `(function () {${script}}).apply(null, ${JSON.stringify(args)})`,
+      returnByValue: true,
+    }) as unknown as Promise<{ result?: { value?: T }; exceptionDetails?: { text?: string; exception?: { description?: string } } }>);
+    if (out?.exceptionDetails) {
+      const error = new Error(`${out.exceptionDetails.exception?.description ?? out.exceptionDetails.text ?? "script error"}`);
+      error.name = "JavascriptError";
+      throw error;
+    }
+    return out?.result?.value as T;
+  };
+  const page = {
+    executeScript: <T>(script: string, ...args: unknown[]) => evaluate<T>(script, args),
+    getCurrentUrl: () => evaluate<string>("return location.href", []),
+  };
+  return page as unknown as WebDriver;
+}
+/**
+ * Non-blocking navigation of the current tab (never driver.get in a background step). A navigation started inside the
+ * command makes ChromeDriver wait for it, so the script only schedules it; commands on other tabs then run immediately.
+ */
+async function navigateWithoutWaiting(driver: WebDriver, url: string): Promise<void> {
+  await driver.executeScript("setTimeout(() => { location.href = arguments[0]; }, 30)", url);
+}
+
+async function activateChrome(driver: WebDriver): Promise<void> {
+  const chromium = driver as Driver;
+  await chromium.sendDevToolsCommand("Page.setWebLifecycleState", {
+    state: "active",
+  });
+  await chromium.sendDevToolsCommand("Page.bringToFront", {});
+}
+
+/** Entry mode for a run: fast = batched entry (phase 1); early = fill before full load (phase 2). */
+type EntryMode = { fast: boolean; early: boolean };
+const LEGACY_ENTRY: EntryMode = { fast: false, early: false };
+
+async function waitForSection(driver: WebDriver, name: string, mode: EntryMode = LEGACY_ENTRY, between?: () => Promise<void>): Promise<void> {
+  const id = Object.values(steps[name].fields)[0].id;
+  const pollMs = mode.fast ? FAST_POLL_MS : PAGE_POLL_MS;
+  // E7: fast entry activates the tab only before native input; legacy entry keeps the per-section activation.
+  if (!mode.fast) await activateChrome(driver);
+  if (mode.early) {
+    // DOM-ready entry: no ready(); one wait keeps the READY_WAIT_MS + SECTION_WAIT_MS budget.
+    await waitWithCaptcha(driver, async () => {
+      checkCancelled();
+      await requireSession(driver);
+      return sectionDomReady(driver, id);
+    }, EARLY_SECTION_WAIT_MS, FAST_POLL_MS, between);
+    return;
+  }
+  await ready(driver, pollMs);
+  await waitWithCaptcha(driver, async () => {
+    await requireSession(driver);
+    return (await driver.findElements(By.id(id))).length === 1;
+  }, SECTION_WAIT_MS, pollMs, between);
+}
+
+async function remoteTrigger(
+  driver: WebDriver,
+  element: WebElement,
+): Promise<boolean> {
+  return driver.executeScript<boolean>(
+    `return (${REMOTE_TRIGGER_FN})(arguments[0]);`,
+    element,
+  );
+}
+
+interface SavedSection {
+  filled: string[];
+  persisted: string[];
+  lookups: string[];
+}
+
+const savedReportSchema = z.record(
+  z
+    .object({
+      filled: z.array(z.string()),
+      persisted: z.array(z.string()),
+      lookups: z.array(z.string()),
+    })
+    .strict(),
+);
+
+async function previousSavedReport(
+  resuming: boolean,
+): Promise<Record<string, SavedSection>> {
+  if (!resuming) return {};
+  try {
+    return savedReportSchema.parse(
+      JSON.parse(
+        await readFile(join(reportDirectory, "coverage-saved.json"), "utf8"),
+      ),
+    );
+  } catch {
+    return {};
+  }
+}
+
+async function locateField(driver: WebDriver, id: string, pollMs = PAGE_POLL_MS): Promise<WebElement> {
+  const element = await waitWithCaptcha(driver, async () => {
+    await requireSession(driver);
+    const elements = await driver.findElements(By.id(id));
+    return elements.length === 1 ? elements[0] : undefined;
+  }, SECTION_WAIT_MS, pollMs);
+  if (!element)
+    throw new WorkingHolidayStop(
+      "Expected form control did not become available.",
+    );
+  return element;
+}
+
+function isTransientElementError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    (error.name === "StaleElementReferenceError" ||
+      error.name === "NoSuchElementError")
+  );
+}
+
+async function clickWithFallback(
+  driver: WebDriver,
+  element: WebElement,
+): Promise<void> {
+  await activateChrome(driver);
+  try {
+    await element.click();
+  } catch {
+    await driver.executeScript(
+      "arguments[0].scrollIntoView({block:'center'}); arguments[0].click();",
+      element,
+    );
+  }
+}
+
+/** Lookup (search/select) clicks wait for the real outcome. They save nothing, so no persistence event. */
+async function lookupClickAndWait(
+  driver: WebDriver,
+  trigger: WebElement,
+  condition: () => Promise<boolean>,
+  timeoutMessage: string,
+  tag: string,
+  timeout = lookupTimeoutMs(),
+): Promise<void> {
+  await clickWithFallback(driver, trigger);
+  const started = Date.now();
+  let beat = started;
+  try {
+    await waitWithCaptcha(driver, async () => {
+      await requireSession(driver);
+      if (Date.now() - beat >= 10000) {
+        beat = Date.now();
+        console.log(quiet(`${tag} Đang chờ trang phản hồi… ${Math.round((beat - started) / 1000)}s/${Math.round(timeout / 1000)}s`));
+      }
+      try {
+        return await condition();
+      } catch (error) {
+        if (isTransientElementError(error)) return false;
+        throw error;
+      }
+    }, timeout);
+  } catch (error) {
+    if (error instanceof Error && error.name === "TimeoutError")
+      throw new WorkingHolidayStop(`${timeoutMessage} (${Math.round((Date.now() - started) / 1000)}s)`);
+    throw error;
+  }
+}
+
+async function postbackAndWait(
+  driver: WebDriver,
+  trigger: WebElement,
+  name: string,
+  fast = false,
+  level: PostbackLevel = "complete",
+): Promise<void> {
+  const stamp = await driver.executeScript<number>(
+    "return performance.timeOrigin",
+  );
+  // Keep the tab active before native SAVE/search/result button activation.
+  await activateChrome(driver);
+  await emit({ type: "persistence", state: "possible" });
+  await trigger.sendKeys(Key.SPACE);
+  try {
+    await waitForPostback(driver, name, stamp, fast, level);
+  } catch (error) {
+    if (error instanceof Error && error.name === "TimeoutError") {
+      // A timeout on the access-denied page is a redirect, not an unverified postback on our section.
+      await throwIfAccessDenied(driver);
+      throw new SectionPostbackTimeoutError(name);
+    }
+    throw error;
+  }
+}
+
+/** "interactive": DOM-ready is enough (pipeline SAVE response); "complete": full load (today). */
+type PostbackLevel = "complete" | "interactive";
+async function waitForPostback(
+  driver: WebDriver,
+  name: string,
+  stamp: number,
+  fast = false,
+  level: PostbackLevel = "complete",
+): Promise<void> {
+  await waitWithCaptcha(driver, async () => {
+    await requireSession(driver);
+    return driver.executeScript<boolean>(
+      `
+      const manager = typeof Sys !== 'undefined' && Sys.WebForms && Sys.WebForms.PageRequestManager ? Sys.WebForms.PageRequestManager.getInstance() : null;
+      return performance.timeOrigin !== arguments[1] && document.readyState ${level === 'interactive' ? "!== 'loading'" : "=== 'complete'"} && !(manager && manager.get_isInAsyncPostBack()) && (typeof jQuery === 'undefined' || jQuery.active === 0) && !!document.getElementById(arguments[0]);
+    `,
+      Object.values(steps[name].fields)[0].id,
+      stamp,
+    );
+  }, POSTBACK_WAIT_MS, fast ? FAST_POLL_MS : PAGE_POLL_MS);
+  // The predicate already proved a new document with the first field present (fast); legacy re-waits.
+  if (!fast) await waitForSection(driver, name);
+}
+
+const selectionMatches = (label: string, expected: string): boolean =>
+  label.trim() !== "" && pickResult([label], expected) === 0;
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/** Search result elements (any tag); label comes from `value`, else the text. */
+async function readResults(driver: WebDriver, prefix: string): Promise<{ id: string; label: string }[]> {
+  return driver.executeScript<{ id: string; label: string }[]>(
+    `return Array.from(document.querySelectorAll('[id^="' + arguments[0] + '"]')).map(e => ({ id: e.id, label: String(e.value || e.textContent || '').trim() }));`,
+    prefix,
+  );
+}
+
+/** True once the page is not loading and no async postback is running. */
+async function pageIdle(driver: WebDriver): Promise<boolean> {
+  return driver.executeScript<boolean>(`
+    const manager = typeof Sys !== 'undefined' && Sys.WebForms && Sys.WebForms.PageRequestManager ? Sys.WebForms.PageRequestManager.getInstance() : null;
+    return document.readyState === 'complete' && !(manager && manager.get_isInAsyncPostBack());
+  `);
+}
+
+/** Wait for results to appear, or for the page to settle (idle 3s) with none. Never throws on timeout. */
+async function waitForResults(
+  driver: WebDriver,
+  tag: string,
+  prefix: string,
+  timeout: number,
+): Promise<{ id: string; label: string }[]> {
+  const started = Date.now();
+  let beat = started;
+  let idleSince = 0;
+  try {
+    return (await waitWithCaptcha<{ id: string; label: string }[] | false>(driver, async () => {
+      await requireSession(driver);
+      if (Date.now() - beat >= 10000) {
+        beat = Date.now();
+        console.log(quiet(`${tag} Đang chờ trang phản hồi… ${Math.round((beat - started) / 1000)}s/${Math.round(timeout / 1000)}s`));
+      }
+      try {
+        const idle = await pageIdle(driver);
+        const results = idle ? await readResults(driver, prefix) : [];
+        if (results.length > 0) return results;
+        if (!idle) { idleSince = 0; return false; }
+        idleSince ||= Date.now();
+        return Date.now() - idleSince >= 3000 ? results : false;
+      } catch (error) {
+        if (isTransientElementError(error)) { idleSince = 0; return false; }
+        throw error;
+      }
+    }, timeout)) as { id: string; label: string }[];
+  } catch (error) {
+    if (error instanceof Error && error.name === "TimeoutError") {
+      console.log(quiet(`${tag} Hết ${Math.round(timeout / 1000)}s mà trang vẫn chưa phản hồi; xem như 0 kết quả.`));
+      return [];
+    }
+    throw error;
+  }
+}
+
+async function typeQuery(driver: WebDriver, lookup: OccupationLookup, text: string): Promise<void> {
+  const field = steps.occupation.fields[lookup.queryKey];
+  const query = await locateField(driver, field.id);
+  await setField(driver, field, text, query);
+  const typed = await driver.executeScript<string>("return arguments[0].value", query);
+  if (typed !== text)
+    throw new WorkingHolidayStop(`Search query readback failed: ${lookup.queryKey}.`);
+}
+
+/** Type + click search (retry with backoff) until results appear. Returns the results seen. */
+async function searchWithRetry(
+  driver: WebDriver,
+  lookup: OccupationLookup,
+  tag: string,
+  text: string,
+  timeout: number,
+): Promise<{ id: string; label: string }[]> {
+  const backoff = [2000, 5000];
+  const started = Date.now();
+  for (let attempt = 0; ; attempt++) {
+    await typeQuery(driver, lookup, text);
+    console.log(quiet(`${tag} Tìm "${text}" (lần ${attempt + 1}/${backoff.length + 1}), chờ tối đa ${Math.round(timeout / 1000)}s.`));
+    await clickWithFallback(driver, await locateField(driver, lookup.searchButtonId));
+    const results = await waitForResults(driver, tag, lookup.resultButtonPrefix, timeout);
+    const seconds = Math.round((Date.now() - started) / 1000);
+    if (results.length > 0) {
+      console.log(quiet(`${tag} Đã tìm "${text}": ${results.length} kết quả sau ${seconds}s.`));
+      return results;
+    }
+    console.log(quiet(`${tag} Đã tìm "${text}": 0 kết quả sau ${seconds}s.`));
+    if (attempt >= backoff.length) return [];
+    await sleep(backoff[attempt]);
+  }
+}
+
+/** Click the control's "full list" link when present and return the list shown. */
+async function openFullList(driver: WebDriver, lookup: OccupationLookup, tag: string, timeout: number) {
+  const control = lookup.searchButtonId.includes("industryControl") ? "industryControl" : "occupationControl";
+  const links = await driver.executeScript<WebElement[]>(
+    `return Array.from(document.querySelectorAll('a')).filter(a => /full\\s*list/i.test(a.textContent || '') && (a.id.includes(arguments[0]) || !/Control/.test(a.id)));`,
+    control,
+  );
+  if (links.length === 0) {
+    console.log(quiet(`${tag} Không thấy liên kết "full list" trên trang.`));
+    return [];
+  }
+  console.log(quiet(`${tag} Mở danh sách đầy đủ ("full list").`));
+  await clickWithFallback(driver, links[0]);
+  return waitForResults(driver, tag, lookup.resultButtonPrefix, timeout);
+}
+
+async function occupationSelection(
+  driver: WebDriver,
+  data: ApplicationData,
+): Promise<string[]> {
+  const selected: string[] = [];
+  const timeout = lookupTimeoutMs();
+  for (const lookup of occupationLookups) {
+    const tag = `[NZWH] ${lookup.resultKey}:`;
+    const expected = data.occupation[lookup.resultKey];
+    const existing = await driver.findElements(By.id(lookup.selectedLabelId));
+    if (existing.length === 1 && selectionMatches(await existing[0].getText(), expected)) {
+      selected.push(lookup.resultKey);
+      console.log(quiet(`${tag} Giá trị đã chọn khớp; bỏ qua bước tìm kiếm.`));
+      continue;
+    }
+    const started = Date.now();
+    const queries = queryPlan(data.occupation[lookup.queryKey], data.occupation[lookup.altQueryKey] ?? "");
+    let results: { id: string; label: string }[] = [];
+    let pick = -1;
+    let total = 0;
+    const seen = new Set<string>();
+    for (const [index, text] of queries.entries()) {
+      results = await searchWithRetry(driver, lookup, tag, text, timeout);
+      results.forEach((r) => seen.add(r.label));
+      total = Math.max(total, results.length);
+      pick = pickResult(results.map((r) => r.label), expected);
+      if (pick >= 0) break;
+      if (index < queries.length - 1) console.log(quiet(`${tag} Không có kết quả khớp "${expected}" cho "${text}"; thử cụm từ khác.`));
+    }
+    if (pick < 0) {
+      results = await openFullList(driver, lookup, tag, timeout);
+      results.forEach((r) => seen.add(r.label));
+      total = Math.max(total, results.length);
+      pick = pickResult(results.map((r) => r.label), expected);
+    }
+    if (pick < 0) {
+      const message = `Không tìm thấy "${expected}" sau khi tìm [${queries.join(", ")}] (${total} kết quả, ${Math.round((Date.now() - started) / 1000)}s). Kết quả quan sát: [${[...seen].slice(0, 20).map((l) => `"${l}"`).join(", ")}]. Hãy dùng đúng nhãn hiển thị trên trang.`;
+      console.log(quiet(`${tag} ${message}`));
+      throw new WorkingHolidayStop(message);
+    }
+    console.log(quiet(`${tag} Chọn kết quả "${results[pick].label}".`));
+    await lookupClickAndWait(
+      driver,
+      await locateField(driver, results[pick].id),
+      async () => {
+        const found = await driver.findElements(By.id(lookup.selectedLabelId));
+        return found.length === 1 && selectionMatches(await found[0].getText(), expected);
+      },
+      `${tag} Đã bấm "${expected}" nhưng "Selected Value" không cập nhật`,
+      tag,
+      timeout,
+    );
+    await ready(driver);
+    selected.push(lookup.resultKey);
+    console.log(quiet(`${tag} Đã chọn và xác minh "Selected Value" sau ${Math.round((Date.now() - started) / 1000)}s.`));
+  }
+  return selected;
+}
+
+/** Test only: run the occupation lookups against a fixture page. */
+export const occupationSelectionForTest = occupationSelection;
+
+async function sectionSaveControl(
+  driver: WebDriver,
+  name: string,
+): Promise<WebElement> {
+  const save = await driver.findElements(
+    By.id(
+      "ContentPlaceHolder1_wizardPageFooter_wizardPageNavigator_validateButton",
+    ),
+  );
+  if (
+    save.length === 1 &&
+    (await save[0].isDisplayed()) &&
+    (await save[0].isEnabled())
+  )
+    return save[0];
+  // Once all sections are complete the footer exposes final SUBMIT instead of
+  // SAVE. Re-post only this section's observed tab; never activate final SUBMIT.
+  const tabs: Record<string, string> = {
+    personal: "pageTabs_TabHeaders_tabButton_0",
+    identification: "pageTabs_TabHeaders_tabButton_1",
+    occupation: "pageTabs_TabHeaders_tabButton_2",
+    health: "sectionTabs_TabHeaders_tabButton_1",
+    character: "sectionTabs_TabHeaders_tabButton_2",
+    adviser: "sectionTabs_TabHeaders_tabButton_3",
+    workingHoliday: "sectionTabs_TabHeaders_tabButton_4",
+  };
+  const completeFooter = await driver.findElements(
+    By.id(
+      "ContentPlaceHolder1_wizardPageFooter_wizardPageNavigator_submitImageButton",
+    ),
+  );
+  if (completeFooter.length !== 1)
+    throw new WorkingHolidayStop(
+      `SAVE unavailable in ${name}; no inspected completed-draft footer found. Final SUBMIT was not clicked.`,
+    );
+  const tab = await locateField(
+    driver,
+    `ContentPlaceHolder1_wizardPageHeader_nav_${tabs[name]}`,
+  );
+  if (!(await tab.isDisplayed()) || !(await tab.isEnabled()))
+    throw new WorkingHolidayStop(
+      `Current-section tab unavailable in ${name}; final SUBMIT was not clicked.`,
+    );
+  console.log(
+    `[NZWH] ${name}: SAVE is absent on this completed draft. Re-posting the current section tab and verifying persistence; final SUBMIT is excluded.`,
+  );
+  return tab;
+}
+
+/** Today's per-field entry: locate, check availability, type/select, read back. */
+async function legacyFillField(
+  driver: WebDriver,
+  name: string,
+  key: string,
+  field: FieldDefinition,
+  data: ApplicationData,
+  report: SavedSection,
+  fast: boolean,
+): Promise<void> {
+  await requireSession(driver);
+  if (
+    name === "adviser" &&
+    key === "exemptionReason" &&
+    !applicable(data, name, key)
+  )
+    return;
+  if (field.lookup) return; // Search/result workflow below owns these transient inputs.
+  const sourceValue = data[name as SectionName][key];
+  const expected = expectedFieldValue(name, key, sourceValue);
+  if (expected !== sourceValue)
+    console.log(quiet(`[NZWH] ${name}.${key}: prepared for website persistence (colons removed; source document unchanged).`));
+  const pollMs = fast ? FAST_POLL_MS : PAGE_POLL_MS;
+  let element = await locateField(driver, field.id, pollMs);
+  if (
+    !(await element.isEnabled()) ||
+    (field.kind !== "select" && !(await element.isDisplayed()))
+  ) {
+    if (applicable(data, name, key) && expected)
+      throw new WorkingHolidayStop(
+        `Required conditional field unavailable: ${name}.${key}.`,
+      );
+    return;
+  }
+  if (!applicable(data, name, key) && expected) return;
+  const posts = await remoteTrigger(driver, element);
+  const current = await element.getAttribute("value");
+  const stamp = posts
+    ? await driver.executeScript<number>("return performance.timeOrigin")
+    : 0;
+  if (posts && current !== expected)
+    await emit({ type: "persistence", state: "possible" });
+  if (fast) await activateChrome(driver); // E7: native input needs the active tab
+  await setField(driver, field, expected, element);
+  // Reselect matching values too. Same-value selections may not emit change,
+  // so only require a postback when the underlying value actually changes.
+  if (posts && current !== expected) {
+    await waitForPostback(driver, name, stamp, fast);
+    element = await locateField(driver, field.id, pollMs);
+  }
+  if (
+    (await driver.executeScript<string>(
+      "return arguments[0].value",
+      element,
+    )) !== expected
+  )
+    throw new WorkingHolidayStop(`Readback mismatch: ${name}.${key}.`);
+  addFilled(report, key);
+  console.log(quiet(`[NZWH] ${name}.${key}: entered and read back.`));
+}
+
+/** Counts and durations only; never values. */
+interface FillStats {
+  fast: number;
+  unchanged: number;
+  standard: number;
+  skipped: number;
+  segments: number;
+  standardMs: number;
+  /** Phase 2 only: early-pass writes, postback restarts, settle-barrier time. */
+  early: number;
+  restarts: number;
+  settleMs: number;
+  /** Authoritative writes that replaced an early write (a load-time handler changed the field); gates nothing, aids diagnosis. */
+  changedAfterEarly: number;
+}
+const emptyStats = (): FillStats => ({ fast: 0, unchanged: 0, standard: 0, skipped: 0, segments: 0, standardMs: 0, early: 0, restarts: 0, settleMs: 0, changedAfterEarly: 0 });
+
+/** A redirect to the access-denied page is not a reload of our form: decide that before marking a save as possible. */
+async function throwIfAccessDenied(driver: WebDriver): Promise<void> {
+  if (await isAccessDenied(driver)) throw new AccessDeniedError();
+}
+
+async function unexpectedReload(driver: WebDriver): Promise<never> {
+  await throwIfAccessDenied(driver);
+  await emit({ type: "persistence", state: "possible" });
+  throw new WorkingHolidayStop("Form reloaded unexpectedly while filling; stopped before SAVE.");
+}
+
+/** Batched entry: one script per segment; posting/unusual fields use the standard entry. */
+async function fastFillSection(
+  driver: WebDriver,
+  name: SectionName,
+  data: ApplicationData,
+  report: SavedSection,
+  atom: string,
+  mode: EntryMode = { fast: true, early: false },
+): Promise<FillStats> {
+  const stats = emptyStats();
+  const entries = planSection(name, data);
+  const byKey = new Map(entries.map((entry) => [entry.key, entry]));
+  let stamp = await readTimeOrigin(driver);
+  const waitFor = async (condition: () => Promise<boolean>, timeout: number, message: string) => {
+    try {
+      await waitWithCaptcha(driver, async () => {
+        checkCancelled();
+        await requireSession(driver);
+        return condition();
+      }, timeout, FAST_POLL_MS);
+    } catch (error) {
+      if (error instanceof webdriverError.TimeoutError) {
+        await throwIfAccessDenied(driver);
+        throw new WorkingHolidayStop(message);
+      }
+      throw error;
+    }
+    if ((await readTimeOrigin(driver)) !== stamp) await unexpectedReload(driver);
+  };
+  const record = (out: SegmentResult) => {
+    for (const result of out.results) {
+      const entry = byKey.get(result.key)!;
+      if (result.status === "filled" || result.status === "unchanged") {
+        if (result.status === "filled") stats.fast++;
+        else stats.unchanged++;
+        addFilled(report, entry.key);
+        if (entry.colonsPrepared)
+          console.log(quiet(`[NZWH] ${name}.${entry.key}: prepared for website persistence (colons removed; source document unchanged).`));
+        console.log(quiet(`[NZWH] ${name}.${entry.key}: entered and read back.`));
+      } else stats.skipped++;
+    }
+  };
+  const runFill = async () => {
+    report.filled = [];
+    const resumes = new Map<string, number>();
+    const resume = (entry: FillEntry, message: string) => {
+      const count = (resumes.get(entry.key) ?? 0) + 1;
+      resumes.set(entry.key, count);
+      if (count > MAX_FIELD_RESUMES) throw new WorkingHolidayStop(message);
+    };
+    let index = 0;
+    while (index < entries.length) {
+      checkCancelled();
+      await captchaGuard(driver);
+      await requireSession(driver);
+      let out;
+      try {
+        out = await fillSegment(driver, atom, entries, index);
+      } catch (error) {
+        if (isNavigationError(error)) await unexpectedReload(driver);
+        throw error;
+      }
+      stats.segments++;
+      if (out.timeOrigin !== stamp) await unexpectedReload(driver);
+      record(out);
+      if (!out.stop) break;
+      const i = out.stop.index;
+      const entry = entries[i];
+      switch (out.stop.reason) {
+        case "yield":
+          index = i;
+          break;
+        case "missing": {
+          const message = "Expected form control did not become available.";
+          resume(entry, message);
+          await waitFor(() => fieldPresent(driver, entry.id), SECTION_WAIT_MS, message);
+          index = i;
+          break;
+        }
+        case "unavailable-required": {
+          const message = `Required conditional field unavailable: ${name}.${entry.key}.`;
+          resume(entry, message);
+          await waitFor(() => fieldAvailable(driver, atom, entry.id, entry.kind), DEPENDENT_FIELD_TIMEOUT_MS, message);
+          index = i;
+          break;
+        }
+        case "posting":
+        case "fallback": {
+          if (out.stop.reason === "fallback")
+            console.log(`[NZWH] ${name}.${entry.key}: fast entry not accepted (${out.stop.cause}); using standard entry.`);
+          const started = Date.now();
+          await legacyFillField(driver, name, entry.key, steps[name].fields[entry.key], data, report, true);
+          stats.standardMs += Date.now() - started;
+          stats.standard++;
+          stamp = await readTimeOrigin(driver);
+          index = i + 1;
+          break;
+        }
+      }
+    }
+  };
+  // Pre-SAVE re-check: a later handler or postback must not have altered an earlier field.
+  const recheck = async (): Promise<string | null> => {
+    const read = await readFieldValues(driver, report.filled.map((key) => byKey.get(key)!.id));
+    if (read.timeOrigin !== stamp) await unexpectedReload(driver);
+    for (const [position, key] of report.filled.entries()) {
+      const value = read.values[position];
+      if (value === null) throw new WorkingHolidayStop("Expected form control did not become available.");
+      if (value !== byKey.get(key)!.expected) return key;
+    }
+    return null;
+  };
+  if (!mode.early) {
+    await runFill();
+    if (await recheck()) {
+      await runFill();
+      const mismatch = await recheck();
+      if (mismatch) throw new WorkingHolidayStop(`Readback mismatch: ${name}.${mismatch}.`);
+    }
+    return stats;
+  }
+
+  // Phase 2. Early pass: fill as fields appear before load; never posts, never fatal for availability.
+  const segment = async (start: number, opts: { deferClears: boolean; restoreEarly: boolean }): Promise<SegmentResult> => {
+    checkCancelled();
+    await captchaGuard(driver);
+    await requireSession(driver);
+    let out: SegmentResult;
+    try {
+      out = await fillSegment(driver, atom, entries, start, opts);
+    } catch (error) {
+      if (isNavigationError(error)) await unexpectedReload(driver);
+      throw error;
+    }
+    stats.segments++;
+    if (out.timeOrigin !== stamp) await unexpectedReload(driver);
+    return out;
+  };
+  const waitEarly = async (entry: FillEntry, presence: "present" | "available"): Promise<"ready" | "loaded"> => {
+    try {
+      return await waitWithCaptcha(driver, async () => {
+        checkCancelled();
+        await requireSession(driver);
+        const r = await waitForFieldInPage(driver, atom, entry.id, presence, FIELD_WAIT_SLICE_MS, true);
+        return r === "pending" ? null : r;
+      }, EARLY_FIELD_WAIT_MS, FAST_POLL_MS);
+    } catch (error) {
+      // Timeout defers the field to the authoritative pass.
+      if (error instanceof webdriverError.TimeoutError) return "loaded";
+      throw error;
+    }
+  };
+  const earlyKeys = new Set<string>();
+  const runEarly = async () => {
+    const resumes = new Map<string, number>();
+    let index = 0;
+    while (index < entries.length) {
+      const out = await segment(index, { deferClears: true, restoreEarly: false });
+      for (const result of out.results) if (result.status === "filled") { stats.early++; earlyKeys.add(result.key); }
+      if (!out.stop) return;
+      const i = out.stop.index;
+      const entry = entries[i];
+      switch (out.stop.reason) {
+        case "yield":
+          index = i;
+          break;
+        case "missing":
+        case "unavailable-required": {
+          const n = (resumes.get(entry.key) ?? 0) + 1;
+          resumes.set(entry.key, n);
+          // Defer, never throw: the authoritative pass decides on the settled DOM.
+          if (n > MAX_FIELD_RESUMES) { index = i + 1; continue; }
+          const r = await waitEarly(entry, out.stop.reason === "missing" ? "present" : "available");
+          index = r === "ready" ? i : i + 1;
+          break;
+        }
+        case "posting":
+        case "fallback":
+          // No server postback and no unrecorded legacy write before load.
+          return;
+      }
+    }
+  };
+  const settle = async () => {
+    const started = Date.now();
+    let stable = 0;
+    try {
+      await waitWithCaptcha(driver, async () => {
+        checkCancelled();
+        await requireSession(driver);
+        const state = await readSettleState(driver);
+        if (state && state.timeOrigin !== stamp) await unexpectedReload(driver);
+        if (!state || state.navigating || !state.settled) { stable = 0; return false; }
+        return ++stable >= SETTLE_STABLE_POLLS;
+      }, PRE_SAVE_SETTLE_WAIT_MS, FAST_POLL_MS);
+    } catch (error) {
+      if (error instanceof webdriverError.TimeoutError) {
+        await throwIfAccessDenied(driver);
+        throw new WorkingHolidayStop("Page did not settle before SAVE; stopped.");
+      }
+      throw error;
+    } finally {
+      stats.settleMs += Date.now() - started;
+    }
+  };
+  const runAuthoritative = async (): Promise<"postback" | { wrote: boolean }> => {
+    report.filled = [];
+    const resumes = new Map<string, number>();
+    const resume = (entry: FillEntry, message: string) => {
+      const count = (resumes.get(entry.key) ?? 0) + 1;
+      resumes.set(entry.key, count);
+      if (count > MAX_FIELD_RESUMES) throw new WorkingHolidayStop(message);
+    };
+    let index = 0;
+    let wrote = false;
+    while (index < entries.length) {
+      const out = await segment(index, { deferClears: false, restoreEarly: true });
+      record(out);
+      for (const result of out.results) if (result.status === "filled" && earlyKeys.has(result.key)) stats.changedAfterEarly++;
+      if (out.results.some((result) => result.status === "filled")) wrote = true;
+      if (!out.stop) break;
+      const i = out.stop.index;
+      const entry = entries[i];
+      switch (out.stop.reason) {
+        case "yield":
+          index = i;
+          break;
+        case "missing": {
+          const message = "Expected form control did not become available.";
+          resume(entry, message);
+          await waitFor(() => fieldPresent(driver, entry.id), SECTION_WAIT_MS, message);
+          index = i;
+          break;
+        }
+        case "unavailable-required": {
+          const message = `Required conditional field unavailable: ${name}.${entry.key}.`;
+          resume(entry, message);
+          await waitFor(() => fieldAvailable(driver, atom, entry.id, entry.kind), DEPENDENT_FIELD_TIMEOUT_MS, message);
+          index = i;
+          break;
+        }
+        case "posting":
+        case "fallback": {
+          if (out.stop.reason === "fallback")
+            console.log(`[NZWH] ${name}.${entry.key}: fast entry not accepted (${out.stop.cause}); using standard entry.`);
+          const started = Date.now();
+          await legacyFillField(driver, name, entry.key, steps[name].fields[entry.key], data, report, true);
+          stats.standardMs += Date.now() - started;
+          stats.standard++;
+          const next = await readTimeOrigin(driver);
+          // Our own postback reached a new document: re-decide everything on it once settled.
+          if (next !== stamp) { stamp = next; return "postback"; }
+          wrote = true;
+          index = i + 1;
+          break;
+        }
+      }
+    }
+    return { wrote };
+  };
+  // One restart counter per section, shared by the first pass and the re-check refill.
+  let postbacks = 0;
+  const authoritative = async () => {
+    while (true) {
+      await settle();
+      const pass = await runAuthoritative();
+      if (pass === "postback") {
+        if (++postbacks > entries.length)
+          throw new WorkingHolidayStop("Form reloaded repeatedly while filling; stopped.");
+        stats.restarts++;
+        continue;
+      }
+      // E5: the second barrier only follows an authoritative pass that wrote something the early pass had not.
+      if (pass.wrote) await settle();
+      return;
+    }
+  };
+  // Already complete (normal strategy, cached page, eager not honored): behave as phase 1 plus settle reads.
+  if (!(await documentComplete(driver))) await runEarly();
+  await authoritative();
+  if (await recheck()) {
+    await authoritative();
+    const mismatch = await recheck();
+    if (mismatch) throw new WorkingHolidayStop(`Readback mismatch: ${name}.${mismatch}.`);
+  }
+  return stats;
+}
+
+/** Test only: run one section save with a fake or fixture driver. */
+export const saveStepForTest = (driver: WebDriver, name: string, data: ApplicationData, mode: boolean | EntryMode = false) =>
+  saveStep(driver, name, data, typeof mode === "boolean" ? { fast: mode, early: false } : mode);
+
+/** Kill-switch snapshot, read once per run (NZWH_FAST_FILL=0 restores standard entry). */
+function fastEntrySnapshot(): boolean {
+  if (!fastFillEnabled()) {
+    console.log(quiet("[NZWH] Fast entry disabled (NZWH_FAST_FILL)."));
+    return false;
+  }
+  if (isDisplayedAtomSource() === null) {
+    console.log("[NZWH] Fast entry unavailable; using standard entry.");
+    return false;
+  }
+  console.log(quiet("[NZWH] Fast entry enabled."));
+  return true;
+}
+
+/** Phase-2 snapshot, read once per run; only meaningful when fast entry is on. */
+function earlyEntrySnapshot(fast: boolean): boolean {
+  if (!fast) return false;
+  if (!earlyFillEnabled()) {
+    console.log("[NZWH] Early fill disabled (NZWH_EARLY_FILL).");
+    return false;
+  }
+  console.log("[NZWH] Early fill enabled.");
+  return true;
+}
+
+/**
+ * eagerSession: the session may skip `load`, so load preconditions are restored (unknown => eager).
+ * early: the early pass runs only when eager is confirmed.
+ */
+function entrySession(requestedEager: boolean, reported: unknown): { eagerSession: boolean; early: boolean } {
+  return { eagerSession: requestedEager && reported !== "normal", early: requestedEager && reported === "eager" };
+}
+export const entrySessionForTest = entrySession;
+
+/** Submission/declaration/payment click waits: change, then full load when the session may be eager. */
+function submissionWaitForChange(driver: WebDriver, eagerSession: boolean): (condition: () => Promise<boolean>) => Promise<unknown> {
+  if (!eagerSession) return condition => driver.wait(condition, SUBMISSION_CHANGE_WAIT_MS);
+  return condition => waitForChangeThenLoad(driver, condition, async () => {
+    checkCancelled();
+    await assertSiteAvailable(driver);
+  });
+}
+export const submissionWaitForChangeForTest = submissionWaitForChange;
+
+const gapText = (gap: number | null) => (gap === null ? "n/a" : String(gap));
+
+const SAVE_BUTTON_ID = "ContentPlaceHolder1_wizardPageFooter_wizardPageNavigator_validateButton";
+/** E6: unmapped-field check, current URL and SAVE-control choice in one round trip (SAVE only; SUBMIT footers use sectionSaveControl). */
+const PRE_SAVE_JS = `
+    const mapped = new Set(arguments[0]);
+    const unmapped = Array.from(document.querySelectorAll('input,select,textarea')).filter(e => {
+      if (!e.id.startsWith('ContentPlaceHolder1_') || mapped.has(e.id) || ['hidden','submit','image','button'].includes(e.type)) return false;
+      const visible = e.getBoundingClientRect().width > 0 || !!document.querySelector('#s2id_' + e.id);
+      return visible && !e.disabled;
+    }).map(e => e.id);
+    const save = document.getElementById(arguments[1]);
+    const shown = !!save && save.getBoundingClientRect().width > 0 && save.getBoundingClientRect().height > 0 && getComputedStyle(save).visibility !== 'hidden';
+    return { nzwhPreSave: 1, unmapped, href: location.href, saveId: shown && !save.disabled ? save.id : null };
+  `;
+interface PreSave { unmapped: string[]; href: string | null; saveId: string | null }
+/** Accepts the combined answer, or the legacy bare unmapped list (older fakes); anything else is rejected. */
+export function parsePreSave(raw: unknown): PreSave | null {
+  if (Array.isArray(raw)) return { unmapped: raw.map(String), href: null, saveId: null };
+  if (typeof raw !== "object" || raw === null) return null;
+  const value = raw as Record<string, unknown>;
+  if (value.nzwhPreSave !== 1 || !Array.isArray(value.unmapped)) return null;
+  return {
+    unmapped: value.unmapped.map(String),
+    href: typeof value.href === "string" ? value.href : null,
+    saveId: typeof value.saveId === "string" ? value.saveId : null,
+  };
+}
+
+/** Everything the reload verification needs from the fill+SAVE half of a section. */
+interface SavedTicket {
+  name: string;
+  url: string;
+  report: SavedSection;
+  atom: string | null;
+  mode: EntryMode;
+  verifyKeys: string[];
+  stats: FillStats;
+  fillMs: number;
+  saveMs: number;
+  pageGap: number | null;
+  saveGap: number | null;
+}
+interface SaveSectionOptions {
+  /** Pipeline only: runs after the pre-SAVE check passed and right before the SAVE click (barrier + prefetch). */
+  beforePost?: () => Promise<void>;
+  /** Pipeline only: accept the SAVE response at DOM-ready and leave `persistence accepted` to the load-time re-scan. */
+  interactive?: boolean;
+}
+
+/** Fill, pre-SAVE check, the single SAVE call site and the DOM-ready response checks. */
+async function saveSection(
+  driver: WebDriver,
+  name: string,
+  data: ApplicationData,
+  mode: EntryMode = LEGACY_ENTRY,
+  options: SaveSectionOptions = {},
+): Promise<SavedTicket> {
+  const fast = mode.fast;
+  const report: SavedSection = { filled: [], persisted: [], lookups: [] };
+  const url = await driver.getCurrentUrl();
+  const pageGap = await readLoadGap(driver);
+  const fillStarted = Date.now();
+  let stats = emptyStats();
+  const atom = fast ? isDisplayedAtomSource() : null;
+  if (atom) stats = await fastFillSection(driver, name as SectionName, data, report, atom, mode);
+  else
+    for (const [key, field] of Object.entries(steps[name].fields)) {
+      const started = Date.now();
+      await legacyFillField(driver, name, key, field, data, report, false);
+      stats.standardMs += Date.now() - started;
+      stats.standard++;
+    }
+  const fillMs = Date.now() - fillStarted;
+  if (name === "occupation")
+    report.lookups = await occupationSelection(driver, data);
+  const combined = parsePreSave(await driver.executeScript<unknown>(
+    PRE_SAVE_JS,
+    Object.values(steps[name].fields).map((field) => field.id),
+    SAVE_BUTTON_ID,
+  ));
+  if (!combined) throw new WorkingHolidayStop("Unexpected page state before SAVE.");
+  if (combined.unmapped.length)
+    throw new WorkingHolidayStop(
+      `Additional ${name} branch fields need mapping before SAVE: ${combined.unmapped.join(", ")}.`,
+    );
+  await options.beforePost?.();
+  // Credential validation started at this section's boundary must pass before its own CAPTCHA/SAVE.
+  await execution.getStore()?.validations.get(name);
+  const guarded = await captchaGuard(driver);
+  // A solved CAPTCHA may have changed the page: re-read the URL and the SAVE control the long way.
+  const href = combined.href !== null && !guarded ? combined.href : await driver.getCurrentUrl();
+  if (href !== url)
+    throw new WorkingHolidayStop("Unexpected navigation before SAVE.");
+  const save = combined.saveId && !guarded
+    ? await driver.findElement(By.id(combined.saveId))
+    : await sectionSaveControl(driver, name);
+  const saveStarted = Date.now();
+  await postbackAndWait(driver, save, name, fast, options.interactive ? "interactive" : "complete");
+  const saveGap = await readLoadGap(driver);
+  if (new URL(await driver.getCurrentUrl()).pathname !== new URL(url).pathname)
+    throw new WorkingHolidayStop(
+      "SAVE navigated outside the inspected section; stopped.",
+    );
+  const invalid = await driver.executeScript<number>(ERROR_LABEL_SCAN_JS);
+  if (invalid)
+    throw new WorkingHolidayStop(
+      `Server validation flagged ${invalid} fields in ${name}; stopped before next section.`,
+    );
+  const saveMs = Date.now() - saveStarted;
+  // Pipeline: acceptance waits for the load-time re-scan (tab-pipeline.loadTimeRescan).
+  if (!options.interactive) await emit({ type: "persistence", state: "accepted" });
+  const verifyKeys = report.filled.filter((key) => !steps[name].fields[key].lookup);
+  return { name, url, report, atom, mode, verifyKeys, stats, fillMs, saveMs, pageGap, saveGap };
+}
+
+/** Reload (or an already-navigated tab), batched readback, mismatch handling. Never SAVEs. */
+async function verifySection(
+  driver: WebDriver,
+  ticket: SavedTicket,
+  data: ApplicationData,
+  how: { reload: boolean } = { reload: true },
+): Promise<SavedSection> {
+  const { name, url, report, atom, mode, verifyKeys, stats, fillMs, saveMs, pageGap, saveGap } = ticket;
+  const verifyStarted = Date.now();
+  if (how.reload) await navigate(driver, url);
+  await waitForSection(driver, name, mode);
+  const reloadGap = await readLoadGap(driver);
+  const reloaded = new URL(await driver.getCurrentUrl());
+  const original = new URL(url);
+  if (reloaded.origin !== original.origin || reloaded.pathname !== original.pathname ||
+      reloaded.searchParams.get("ApplicationId") !== original.searchParams.get("ApplicationId"))
+    throw new WorkingHolidayStop("Unexpected application after SAVE reload.");
+  const mismatches: string[] = [];
+  // Fast mode reads every saved value in one script instead of two round trips per field.
+  const verifyIds = verifyKeys.map((key) => steps[name].fields[key].id);
+  let batched = atom ? (await readFieldValues(driver, verifyIds)).values : null;
+  // Early entry reads at DOM-ready: a field inserted or set by load-time scripts may not be final yet.
+  // On any missing/different value, re-read once the reload is fully loaded (the load-first outcome).
+  if (batched && mode.early &&
+      batched.some((actual, position) => actual !== expectedFieldValue(name, verifyKeys[position], data[name as SectionName][verifyKeys[position]]))) {
+    await waitWithCaptcha(driver, async () => {
+      checkCancelled();
+      await requireSession(driver);
+      return documentComplete(driver);
+    }, READY_WAIT_MS, FAST_POLL_MS);
+    batched = (await readFieldValues(driver, verifyIds)).values;
+  }
+  for (const [position, key] of verifyKeys.entries()) {
+    const expected = expectedFieldValue(name, key, data[name as SectionName][key]);
+    let actual: string | null;
+    if (batched) {
+      actual = batched[position];
+      if (actual === null) throw new webdriverError.NoSuchElementError("Saved field missing after reload.");
+    } else {
+      const element = await driver.findElement(By.id(steps[name].fields[key].id));
+      actual = await element.getAttribute("value");
+    }
+    if (actual !== expected) {
+      mismatches.push(`${name}.${key}`);
+      console.log(`[NZWH] Saved-value mismatch ${name}.${key}: ${savedValueDiagnostic(expected, actual)}; section=${steps[name].page}. No applicant values logged.`);
+    } else report.persisted.push(key);
+  }
+  for (const lookup of name === "occupation" ? occupationLookups : []) {
+    const stored = await (
+      await locateField(driver, lookup.selectedLabelId)
+    ).getText();
+    if (!selectionMatches(stored, data.occupation[lookup.resultKey]))
+      mismatches.push(`${name}.${lookup.resultKey}`);
+    else report.persisted.push(lookup.resultKey);
+  }
+  if (mismatches.length)
+    throw new SavedValueVerificationError(mismatches, report.persisted.length);
+  console.log(`[NZWH] ${name}: saved and verified after reload.`);
+  await emit({ type: "persistence", state: "verified" });
+  const verifyMs = Date.now() - verifyStarted;
+  logSectionTiming(ticket, verifyMs, reloadGap, "");
+  console.log(
+    `[NZWH] ${name}: SAVE completed; ${report.persisted.length} values persisted and verified. Continuing in the same tab.`,
+  );
+  return report;
+}
+const ERROR_LABEL_SCAN_JS = `
+    return Array.from(document.querySelectorAll('[errorlabel]')).filter(e => /mandatory|invalid|error/i.test(e.getAttribute('errorlabel') || '') && e.getBoundingClientRect().width > 0).length;
+  `;
+function logSectionTiming(ticket: SavedTicket, verifyMs: number, reloadGap: number | null, suffix: string): void {
+  const { name, stats, mode, fillMs, saveMs, pageGap, saveGap } = ticket;
+  console.log(
+    `[NZWH] ${name}: timing fill ${fillMs}ms (fast ${stats.fast}, unchanged ${stats.unchanged}, standard ${stats.standard} in ${stats.standardMs}ms, skipped ${stats.skipped}, segments ${stats.segments}${mode.early ? `, early ${stats.early}, restarts ${stats.restarts}` : ""})${mode.early ? `, settle ${stats.settleMs}ms` : ""}, save ${saveMs}ms, verify ${verifyMs}ms${suffix}; load gap page ${gapText(pageGap)}/save ${gapText(saveGap)}/reload ${gapText(reloadGap)}ms.`,
+  );
+}
+
+/** Sequential section save: fill + SAVE, then reload verification in the same tab. */
+async function saveStep(
+  driver: WebDriver,
+  name: string,
+  data: ApplicationData,
+  mode: EntryMode = LEGACY_ENTRY,
+): Promise<SavedSection> {
+  return verifySection(driver, await saveSection(driver, name, data, mode), data, { reload: true });
+}
+
+export interface SavedSectionOptions {
+  dataPath: string;
+  section: SectionName;
+  scenario?: string;
+  allowFictionalDraftSave: boolean;
+}
+
+// For verification with an already authenticated, caller-provided Selenium driver.
+// Browser startup and login remain the responsibility of runWorkingHoliday.
+export async function fillAndSaveWorkingHolidaySection(
+  driver: WebDriver,
+  options: SavedSectionOptions,
+): Promise<void> {
+  if (!automatedSection(options.section)) {
+    console.log("[NZWH] Occupation is excluded: no filling, lookup, SAVE or verification.");
+    return;
+  }
+  runStartMs = Date.now();
+  const base = dataSchema.parse(
+    JSON.parse(await readFile(options.dataPath, "utf8")),
+  );
+  const data = scenarioData(base, options.scenario ?? "baseline");
+  validateData(data);
+  if (data.dataKind === "fictional" && !options.allowFictionalDraftSave)
+    throw new WorkingHolidayStop(
+      "Explicit fictional draft saving opt-in is required.",
+    );
+  if (!Object.hasOwn(steps, options.section))
+    throw new WorkingHolidayStop("Unsupported section.");
+  await activateChrome(driver);
+  await ready(driver);
+  const current = new URL(await driver.getCurrentUrl());
+  assertHost(current.href);
+  if (
+    current.pathname !==
+      `/WorkingHoliday/Wizard/${steps[options.section].page}` ||
+    !current.searchParams.get("ApplicationId")
+  )
+    throw new WorkingHolidayStop(
+      "Driver must be on the selected existing draft section.",
+    );
+  if (!windowSizedAtLaunch(driver)) await driver.manage().window().maximize();
+  await requireSession(driver);
+  // Caller-provided driver of unknown strategy, already loaded: phase-1 entry only.
+  const entry: EntryMode = { fast: fastEntrySnapshot(), early: false };
+  await waitForSection(driver, options.section, entry);
+  const report = await saveStep(driver, options.section, data, entry);
+  const saved = await previousSavedReport(true);
+  saved[options.section] = report;
+  await writeFile(
+    join(reportDirectory, "coverage-saved.json"),
+    `${JSON.stringify(saved, null, 2)}\n`,
+  );
+}
+
+export async function runWorkingHoliday(
+  options: WorkingHolidayOptions,
+): Promise<AutomationActionResult> {
+  return execution.run({ hooks: options.hooks, ...newStore(), credentials: options.credentials, captchaMode: options.captchaMode ?? "manual", signal: options.signal }, () =>
+    executeWorkingHoliday(options),
+  );
+}
+async function executeWorkingHoliday(
+  options: WorkingHolidayOptions,
+): Promise<AutomationActionResult> {
+  runStartMs = Date.now();
+  const base = dataSchema.parse(
+    JSON.parse(await readFile(options.dataPath, "utf8")),
+  );
+  const scenario = options.scenario ?? "baseline";
+  const mode = z.enum(["loginOnly", "saveAll", "fillAndSubmit"]).parse(options.mode ?? "saveAll");
+  const data = mode === "loginOnly" ? base : scenarioData(base, scenario);
+  if (mode !== "loginOnly") validateData(data);
+  const fast = mode !== "loginOnly" && fastEntrySnapshot();
+  const requestedEager = earlyEntrySnapshot(fast);
+  const pipeline = pipelineSnapshot(process.env, { attachPort: options.attachPort, fast, early: requestedEager, loginOnly: mode === "loginOnly" });
+  for (const line of pipeline.log) console.log(line);
+  if (mode !== "loginOnly" && base.dataKind === "fictional" && !options.allowFictionalDraftSave)
+    throw new WorkingHolidayStop(
+      "Saving fictional values in the existing live draft requires explicit --allow-fictional-draft-save opt-in.",
+    );
+  console.log(
+    mode === "loginOnly" ? "[NZWH] Chế độ: Chỉ đăng nhập. Giữ Chrome mở sau khi đăng nhập."
+    : mode === "fillAndSubmit"
+      ? "[NZWH] Chế độ: Điền và nộp. Chỉ báo đã nộp khi website xác nhận."
+      : "[NZWH] Chế độ: Chỉ điền. Dừng trước khi nộp hồ sơ để bạn kiểm tra.",
+  );
+  if (
+    options.sections &&
+    (options.sections.length === 0 ||
+      options.sections.some((name) => !Object.hasOwn(steps, name)) ||
+      new Set(options.sections).size !== options.sections.length)
+  )
+    throw new WorkingHolidayStop("Phạm vi mục hồ sơ không hợp lệ.");
+  await checkpoint();
+  await emit({
+    type: "phase",
+    phase: "browser-starting",
+    message: options.attachPort
+      ? `Đang kết nối Chrome ở cổng ${options.attachPort}. Bạn có thể bấm Dừng tác vụ bất cứ lúc nào.`
+      : options.headless
+        ? "Đang mở Chrome ẩn (headless). Bạn có thể bấm Dừng tác vụ bất cứ lúc nào."
+        : "Đang mở Chrome. Bạn có thể bấm Dừng tác vụ bất cứ lúc nào.",
+  });
+  const driver = await chooseBrowser(
+    options.headless && !options.attachPort
+      ? (options.browserType === "profile" ? "profile-headless" : "headless")
+      : (options.browserType ?? "visible"),
+    options.useDefaultAgent ?? true,
+    options.profileName,
+    options.attachPort,
+    options.signal,
+    requestedEager ? "eager" : "normal",
+  );
+  const capabilities = await driver.getCapabilities().catch(() => null);
+  const { eagerSession, early } = entrySession(requestedEager, capabilities?.get?.("pageLoadStrategy"));
+  if (eagerSession) eagerDrivers.add(driver);
+  if (requestedEager && !early)
+    console.log("[NZWH] Early fill: page-load strategy not confirmed as eager; early pass inactive.");
+  const entry: EntryMode = { fast, early };
+  const chromeCapabilities = z
+    .object({ debuggerAddress: z.string() })
+    .safeParse(capabilities?.get("goog:chromeOptions"));
+  const debuggerMatch = chromeCapabilities.success
+    ? /^(?:localhost|127\.0\.0\.1):(\d+)$/.exec(
+        chromeCapabilities.data.debuggerAddress,
+      )
+    : null;
+  await emit({
+    type: "phase",
+    phase: "browser-open",
+    message: "Chrome đã mở.",
+    debugPort: debuggerMatch ? Number(debuggerMatch[1]) : undefined,
+  });
+  await checkpoint();
+  await driver.manage().setTimeouts({ pageLoad: 30000, script: 15000 });
+  if (!windowSizedAtLaunch(driver)) await driver.manage().window().maximize();
+  await activateChrome(driver);
+  // Use one existing tab for the sequential save flow.
+  if (options.attachPort) {
+    const handles = await driver.getAllWindowHandles();
+    await driver.switchTo().window(handles[0]);
+  }
+  // Access-denied recovery: kill switch read once per run; one budget shared by every path of this run.
+  const recoveryEnabled = accessDeniedRecoveryEnabled();
+  if (!recoveryEnabled) console.log("[NZWH] Access-denied recovery disabled (NZWH_ACCESS_DENIED_RECOVERY).");
+  let accessDeniedRecoveries = 0;
+  /** Counts one attempt, then waits the abortable backoff. Logs only the label, attempt and pathname. */
+  const beginAccessDeniedAttempt = async (label: string): Promise<number> => {
+    checkCancelled();
+    console.log(`[NZWH] ${label}: access-denied redirect detected (path=${ACCESS_DENIED_LOG_PATH}).`);
+    await emit({ type: "phase", phase: "recovery", message: "Website chuyển hướng đến trang access-denied. Đang khôi phục an toàn, không gửi lại dữ liệu." });
+    if (!recoveryEnabled) throw new WorkingHolidayStop(ACCESS_DENIED_DISABLED_MESSAGE);
+    const attempt = ++accessDeniedRecoveries;
+    if (attempt > MAX_ACCESS_DENIED_RECOVERIES) {
+      console.log(`[NZWH] ${label}: access-denied recovery limit reached (${MAX_ACCESS_DENIED_RECOVERIES}); stopping.`);
+      throw new WorkingHolidayStop(ACCESS_DENIED_GIVE_UP_MESSAGE);
+    }
+    console.log(`[NZWH] ${label}: access-denied recovery attempt ${attempt}/${MAX_ACCESS_DENIED_RECOVERIES}; waiting ${ACCESS_DENIED_BACKOFF_MS[attempt - 1]}ms before reloading.`);
+    await abortableBackoff(ACCESS_DENIED_BACKOFF_MS[attempt - 1], execution.getStore()?.signal);
+    await emit({ type: "phase", phase: "recovery", message: `Khôi phục lần ${attempt}/${MAX_ACCESS_DENIED_RECOVERIES}: tải lại trang.` });
+    return attempt;
+  };
+  /** Pre-wizard steps send no applicant data, so they restart from the home page within the shared budget. */
+  const withAccessDeniedRetry = async <T>(label: string, step: () => Promise<T>): Promise<T> => {
+    const started = Date.now();
+    let attempts = 0;
+    while (true) {
+      try {
+        const result = await step();
+        if (attempts) console.log(`[NZWH] ${label}: recovered from access-denied after ${attempts} attempt(s) in ${formatDuration(Date.now() - started)}.`);
+        return result;
+      } catch (error) {
+        if (!(error instanceof AccessDeniedError)) throw error;
+        attempts = await beginAccessDeniedAttempt(label);
+        try {
+          await navigate(driver, home);
+        } catch (navigationError) {
+          // The cross-origin denied page makes navigate() rethrow its timeout; the step re-detects it.
+          if (!(navigationError instanceof webdriverError.TimeoutError && await isAccessDenied(driver))) throw navigationError;
+        }
+      }
+    }
+  };
+  if (mode === "loginOnly") {
+    await emit({ type: "phase", phase: "login", message: "Đang đăng nhập trang đích. Chrome sẽ giữ mở sau khi đăng nhập." });
+    await withAccessDeniedRetry("login", () => authenticate(driver, true, options.credentials, true));
+    await checkpoint();
+    return { success: true, outcome: "loggedIn", message: "Đã đăng nhập thành công. Chrome giữ mở để bạn thao tác; chưa mở hoặc điền hồ sơ.", driver };
+  }
+  let applicationPage: URL | undefined;
+  {
+    await emit({
+      type: "phase",
+      phase: "login",
+      message: "Đang đăng nhập trang đích. Chưa mở các trường hồ sơ.",
+    });
+    // Resume without logging out when already inside an in-progress application.
+    const startState = await currentState(driver);
+    let startedInside = false;
+    if (!options.credentials && (startState === "create" || startState === "captcha" || startState === "wizard")) {
+      startedInside = (await driver.findElements(By.css('input[name="username"]'))).length === 0;
+    }
+    if (startedInside && options.country) {
+      const country = options.country;
+      await withAccessDeniedRetry("wizard", () => advanceToWizard(driver, country));
+    } else {
+      await withAccessDeniedRetry("login", () => authenticate(driver, true, options.credentials));
+    }
+    const links = startedInside
+      ? []
+      : await driver.findElements(By.css('a[id*="editHyperLink"]'));
+    if (!links.length && options.country) {
+      const country = options.country;
+      await withAccessDeniedRetry("wizard", () => advanceToWizard(driver, country));
+      applicationPage = new URL(await driver.getCurrentUrl());
+      if (
+        !applicationPage.pathname.startsWith("/WorkingHoliday/Wizard/") ||
+        !applicationPage.searchParams.get("ApplicationId")
+      )
+        throw new WorkingHolidayStop("Unexpected application page.");
+    }
+    if (!applicationPage) {
+    if (!links.length && (await countryTiles(driver)).length > 0)
+      throw new WorkingHolidayStop("Chưa chọn quốc gia trong cấu hình.");
+    if (!links.length)
+      throw new WorkingHolidayStop(
+        "No editable applications found, or login failed.",
+      );
+    const requested =
+      options.expectedApplicationId ?? process.env.NZWH_APPLICATION_ID;
+    if (links.length > 1 && !requested)
+      throw new WorkingHolidayStop(
+        "Multiple applications found; choose NZWH_APPLICATION_ID manually.",
+      );
+    for (const link of links) {
+      const candidate = new URL((await link.getAttribute("href")) ?? "");
+      assertHost(candidate.href);
+      if (
+        !requested ||
+        candidate.searchParams.get("ApplicationId") === requested
+      ) {
+        applicationPage = candidate;
+        break;
+      }
+    }
+    if (
+      !applicationPage ||
+      applicationPage.pathname !== "/WorkingHoliday/Application/Edit.aspx"
+    )
+      throw new WorkingHolidayStop("Selected application not found.");
+    const id = applicationPage.searchParams.get("ApplicationId");
+    await navigate(driver, applicationPage.href);
+    await ready(driver);
+    applicationPage = new URL(await driver.getCurrentUrl());
+    if (
+      !applicationPage.pathname.startsWith("/WorkingHoliday/Wizard/") ||
+      applicationPage.searchParams.get("ApplicationId") !== id
+    )
+      throw new WorkingHolidayStop("Unexpected application page.");
+    }
+  }
+  const selectedApplicationId =
+    applicationPage?.searchParams.get("ApplicationId");
+  if (selectedApplicationId)
+    await emit({ type: "application", id: selectedApplicationId });
+  const saved: Record<string, SavedSection> = {};
+  const skippedBusy: string[] = [];
+  const unverifiedSections: string[] = [];
+  const completedSections: string[] = [];
+  await writeFile(
+    join(reportDirectory, "coverage-busy.json"),
+    `${JSON.stringify({ skippedUnverified: skippedBusy }, null, 2)}\n`,
+  );
+  {
+    const selected = requestedSections({ sections: options.sections });
+    console.log("[NZWH] Occupation is excluded: no filling, lookup, SAVE or verification.");
+    console.log(`[NZWH] Planned form pages: ${selected.join(" → ")}.`);
+    type DeniedOutcome = { outcome: "retry" | "login" | "unverified" } | { outcome: "verified"; keys: string[] };
+    /**
+     * Access-denied redirect inside a section. Re-opens the section with a GET (idempotent). Nothing posted
+     * (risk false): the section is refilled. A save may have been applied (risk true): never refill or
+     * re-click SAVE; read the server state back (read-only) and let the caller verify or mark unverified.
+     */
+    const recoverFromAccessDenied = async (name: SectionName): Promise<DeniedOutcome> => {
+      const started = Date.now();
+      const url = `${origin}/WorkingHoliday/Wizard/${steps[name].page}?${applicationPage?.searchParams.toString()}`;
+      const finish = (outcome: string) =>
+        console.log(`[NZWH] ${name}: access-denied recovery outcome=${outcome} in ${Date.now() - started}ms.`);
+      while (true) {
+        const attempt = await beginAccessDeniedAttempt(name);
+        try {
+          await navigate(driver, url);
+          checkCancelled();
+          await waitForSection(driver, name, entry);
+          const actual = new URL(await driver.getCurrentUrl());
+          assertHost(actual.href);
+          if (actual.pathname !== `/WorkingHoliday/Wizard/${steps[name].page}` ||
+              actual.searchParams.get("ApplicationId") !== applicationPage?.searchParams.get("ApplicationId"))
+            throw new WorkingHolidayStop("Conditional page unavailable or application changed.");
+          if (!sectionRisk(name)) {
+            // Nothing may have been posted: the normal fill starts again on the freshly loaded section.
+            await emit({ type: "phase", phase: "section", message: "Đang xử lý mục hồ sơ đã chọn." });
+            finish(`refill (attempt ${attempt})`);
+            return { outcome: "retry" };
+          }
+          await emit({ type: "phase", phase: "recovery", message: "Đang đọc lại dữ liệu đã lưu (chỉ đọc, không lưu lại)." });
+          const planned = planSection(name, data).filter(item => item.applicable);
+          const matches = async () => {
+            const read = await readFieldValues(driver, planned.map(item => item.id));
+            return read.values.every((value, position) => value === planned[position].expected);
+          };
+          let verified = planned.length > 0 && await matches();
+          if (!verified && planned.length > 0) {
+            // Early entry reads at DOM-ready; re-read once the document is complete before concluding.
+            await waitWithCaptcha(driver, async () => {
+              checkCancelled();
+              await requireSession(driver);
+              return documentComplete(driver);
+            }, READY_WAIT_MS, FAST_POLL_MS);
+            verified = await matches();
+          }
+          await emit({ type: "phase", phase: "section", message: "Đang xử lý mục hồ sơ đã chọn." });
+          finish(verified ? "verified" : "unverified");
+          return verified ? { outcome: "verified", keys: planned.map(item => item.key) } : { outcome: "unverified" };
+        } catch (error) {
+          if (error instanceof StopRequested) throw error;
+          if (error instanceof AccessDeniedError) continue;
+          if (error instanceof SessionExpiredError) { finish("login"); return { outcome: "login" }; }
+          if ((error instanceof webdriverError.TimeoutError || isNavigationError(error)) && await isAccessDenied(driver)) continue;
+          throw error;
+        }
+      }
+    };
+    const keyed = <E extends ExecutionEvent>(name: string, event: E, background: boolean): E =>
+      execution.getStore()?.pipelineActive ? { ...event, section: name, ...(background ? { background: true } : {}) } as E : event;
+    const writeSaved = () => writeFile(join(reportDirectory, "coverage-saved.json"), `${JSON.stringify(saved, null, 2)}\n`);
+    /** Verified section: coverage + result event. Shared by the sequential path and pipeline outcomes. */
+    const completeSection = async (name: SectionName, report: SavedSection, background = false) => {
+      saved[name] = report;
+      completedSections.push(name);
+      await writeSaved();
+      await emit(keyed(name, {
+        type: "section-result",
+        status: "completed",
+        detail: "Đã lưu và xác minh sau khi tải lại.",
+        checked: report.persisted.length,
+        blocked: 0,
+      } as const, background));
+    };
+    /** Maps one section error to its outcome (today's catch block). "retry": run the section body again. */
+    const mapSectionError = async (name: SectionName, caught: unknown, session: { recoveredSession: boolean }): Promise<"retry" | "next"> => {
+      let error: unknown = caught;
+      if (error instanceof StopRequested) throw error;
+      if (typeof error === "object" && error && validationFailures.has(error)) throw error;
+      if (error instanceof AccessDeniedError) {
+        checkCancelled();
+        let result: DeniedOutcome;
+        try {
+          result = await recoverFromAccessDenied(name);
+        } catch (recoveryError) {
+          if (recoveryError instanceof StopRequested) throw recoveryError;
+          await emit({
+            type: "section-result",
+            status: "failed",
+            detail: "Không hoàn tất mục này. Kiểm tra Chrome và trạng thái lưu trước khi thử lại.",
+          });
+          throw new WorkingHolidayStop(
+            `Stopped in ${name}. ${recoveryError instanceof WorkingHolidayStop ? recoveryError.message : "Access-denied recovery did not complete. Check the current Chrome page."} Later sections have not run.`,
+          );
+        }
+        if (result.outcome === "retry") return "retry";
+        if (result.outcome === "verified") {
+          saved[name] = { filled: result.keys, persisted: result.keys, lookups: [] };
+          completedSections.push(name);
+          await writeFile(
+            join(reportDirectory, "coverage-saved.json"),
+            `${JSON.stringify(saved, null, 2)}\n`,
+          );
+          console.log(`[NZWH] ${name}: saved values verified after access-denied redirect; nothing was re-sent.`);
+          await emit({ type: "persistence", state: "verified" });
+          await emit({
+            type: "section-result",
+            status: "completed",
+            detail: "Đã xác minh dữ liệu đã lưu sau khi chuyển hướng; không lưu lại.",
+            checked: result.keys.length,
+            blocked: 0,
+          });
+          return "next";
+        }
+        if (result.outcome === "unverified") {
+          unverifiedSections.push(name);
+          console.log(`[NZWH] ${name}: saved values could not be confirmed after access-denied redirect. No repeat SAVE; continuing to the next selected section.`);
+          await emit({
+            type: "section-result",
+            status: "failed",
+            detail: "Website chuyển hướng đến trang access-denied; chưa xác minh được việc lưu. Không tự lưu lại; tiếp tục mục kế tiếp.",
+          });
+          return "next";
+        }
+        // Login form after the redirect: reuse the one-shot re-authentication path below.
+        error = new SessionExpiredError("The form redirected to login; session is no longer authenticated.");
+      }
+      {
+        const state = await readAuthState(driver);
+        if (state.rejected)
+          throw new WorkingHolidayStop(loginRejectedMessage);
+        if (error instanceof SessionExpiredError || state.loginForm) {
+          if (sectionRisk(name))
+            throw new WorkingHolidayStop(
+              "Phiên đăng nhập hết hạn sau thao tác có thể lưu dữ liệu. Không tự điền lại. Kiểm tra dữ liệu trên Chrome rồi khôi phục có xác nhận.",
+            );
+          if (session.recoveredSession)
+            throw new WorkingHolidayStop(
+              `Session expired again in ${name}; stopped after one recovery attempt.`,
+            );
+          session.recoveredSession = true;
+          console.log(
+            `[NZWH] ${name}: login redirect detected. Re-authenticating once before retrying this section.`,
+          );
+          await authenticate(driver, false, options.credentials);
+          const links = await driver.findElements(
+            By.css('a[id*="editHyperLink"]'),
+          );
+          let sameDraft = false;
+          for (const link of links) {
+            const candidate = new URL(
+              (await link.getAttribute("href")) ?? "",
+            );
+            assertHost(candidate.href);
+            if (
+              candidate.searchParams.get("ApplicationId") ===
+              applicationPage?.searchParams.get("ApplicationId")
+            )
+              sameDraft = true;
+          }
+          if (!sameDraft)
+            throw new WorkingHolidayStop(
+              "Original draft not found after login; stopped without choosing a different application.",
+            );
+          return "retry";
+        }
+      }
+      if (error instanceof SectionPostbackTimeoutError) {
+        const actual = new URL(await driver.getCurrentUrl());
+        assertHost(actual.href);
+        if (actual.pathname !== `/WorkingHoliday/Wizard/${steps[name].page}` ||
+            actual.searchParams.get("ApplicationId") !== selectedApplicationId)
+          throw error;
+        unverifiedSections.push(name);
+        console.log(`[NZWH] ${error.message} No repeat POST; continuing to the next selected section.`);
+        await emit({
+          type: "section-result", status: "failed",
+          detail: "Hết thời gian chờ phản hồi trên cùng mục hồ sơ. Chưa xác minh việc lưu; không tự gửi lại. Tiếp tục mục kế tiếp.",
+        });
+        return "next";
+      }
+      if (error instanceof SavedValueVerificationError) {
+        // saveStep only raises this after a successful reload of the same
+        // authenticated section. Do not replay its POST; process the rest.
+        assertHost(await driver.getCurrentUrl());
+        unverifiedSections.push(name);
+        console.log(`[NZWH] ${error.message} No repeat SAVE; continuing to the next selected section.`);
+        await emit({
+          type: "section-result",
+          status: "failed",
+          detail: `Đã nhận phản hồi lưu nhưng các trường chưa khớp: ${error.fields.join(", ")}. Không tự lưu lại; tiếp tục mục kế tiếp.`,
+          checked: error.checked,
+          blocked: error.fields.length,
+        });
+        return "next";
+      }
+      if (error instanceof SiteBusyError) {
+        assertHost(await driver.getCurrentUrl());
+        skippedBusy.push(name);
+        // A busy response cannot establish whether the last POST persisted.
+        delete saved[name];
+        await writeFile(
+          join(reportDirectory, "coverage-saved.json"),
+          `${JSON.stringify(saved, null, 2)}\n`,
+        );
+        await writeFile(
+          join(reportDirectory, "coverage-busy.json"),
+          `${JSON.stringify({ skippedUnverified: skippedBusy }, null, 2)}\n`,
+        );
+        await emit({
+          type: "section-result",
+          status: "failed",
+          detail:
+            "Trang đích bận. Chưa xác minh việc lưu; không tự thử lại. Các mục tiếp theo vẫn được xử lý.",
+        });
+        console.log(
+          `[NZWH] ${name}: site returned Please try again later. Save state is unverified; moving to the next form section in this same tab.`,
+        );
+        return "next";
+      }
+      await emit({
+        type: "section-result",
+        status: "failed",
+        detail:
+          "Không hoàn tất mục này. Kiểm tra Chrome và trạng thái lưu trước khi thử lại.",
+      });
+      const reason =
+        error instanceof WorkingHolidayStop
+          ? error.message
+          : "Form interaction or page load did not complete. Check the current Chrome page.";
+      throw new WorkingHolidayStop(
+        `Stopped in ${name}. ${reason} Later sections have not run.`,
+      );
+    };
+    const sectionUrl = (name: SectionName) =>
+      `${origin}/WorkingHoliday/Wizard/${steps[name].page}?${applicationPage?.searchParams.toString()}`;
+    /** Sequential section: GET, fill, SAVE, reload verification, in the current tab. */
+    const runSection = async (name: SectionName, opts: { started?: boolean; initialError?: unknown } = {}): Promise<void> => {
+      const context = execution.getStore();
+      context?.riskBySection.set(name, false);
+      if (context) context.currentSection = name;
+      if (!opts.started)
+        await emit({ type: "section-start", section: name, scenario: scenario });
+      const session = { recoveredSession: false };
+      let pending = opts.initialError;
+      let hasPending = "initialError" in opts;
+      while (true) {
+        try {
+          if (hasPending) { hasPending = false; throw pending; }
+          const url = sectionUrl(name);
+          if ((await driver.getCurrentUrl()) !== url)
+            await navigate(driver, url);
+          await waitForSection(driver, name, entry);
+          const actual = new URL(await driver.getCurrentUrl());
+          assertHost(actual.href);
+          if (
+            actual.pathname !== `/WorkingHoliday/Wizard/${steps[name].page}` ||
+            actual.searchParams.get("ApplicationId") !==
+              applicationPage?.searchParams.get("ApplicationId")
+          )
+            throw new WorkingHolidayStop(
+              "Conditional page unavailable or application changed.",
+            );
+          await completeSection(name, await saveStep(driver, name, data, entry));
+          return;
+        } catch (caught) {
+          if ((await mapSectionError(name, caught, session)) === "retry") continue;
+          return;
+        }
+      }
+    };
+    // ---- Tab pipeline (NZWH_TAB_PIPELINE=verify|save); every function below is unused when the mode is off. ----
+    const reasonOf = (error: unknown) =>
+      error instanceof WorkingHolidayStop ? error.message : "Form interaction or page load did not complete. Check the current Chrome page.";
+    const firstFieldId = (name: SectionName) => Object.values(steps[name].fields)[0].id;
+    const backgroundOps = (): TabOps => ({
+      newTab: async () => {
+        await driver.switchTo().newWindow("tab");
+        const handle = await driver.getWindowHandle();
+        await activateChrome(driver);
+        return handle;
+      },
+      closeTab: async () => { await driver.close(); },
+      focus: async (handle) => { await driver.switchTo().window(handle); await activateChrome(driver); },
+      rescan: async () => {
+        const page = cdpPage(driver);
+        try {
+          if (!(await documentComplete(page))) return "pending";
+          return await page.executeScript<number>(ERROR_LABEL_SCAN_JS);
+        } catch (error) { if (isNavigationError(error)) return "pending"; throw error; }
+      },
+      startReload: async (tab) => {
+        tab.stamp = await readTimeOrigin(cdpPage(driver));
+        await navigateWithoutWaiting(cdpPage(driver), (tab.ticket as SavedTicket).url);
+      },
+      pollReload: async (tab) => {
+        const page = cdpPage(driver);
+        try {
+          const probe = await readPageProbe(page);
+          if (probe) {
+            if (probe.site === "denied") return "denied";
+            if (probe.site) return "busy";
+            if (probe.auth.rejected || probe.auth.loginForm) return "login";
+            if (probe.captcha) return "captcha";
+          } else {
+            const site = await page.executeScript<unknown>(SITE_STATE_JS);
+            if (site === "denied") return "denied";
+            if (site) return "busy";
+            const auth = await readAuthState(page);
+            if (auth.rejected || auth.loginForm) return "login";
+            if (await captchaPending(page)) return "captcha";
+          }
+          if ((await readTimeOrigin(page)) === tab.stamp) return "pending";
+          return (await sectionDomReady(page, firstFieldId(tab.name))) ? "ready" : "pending";
+        } catch (error) { if (isNavigationError(error)) return "pending"; throw error; }
+      },
+      readback: async (tab) => {
+        const ticket = tab.ticket as SavedTicket;
+        const page = cdpPage(driver);
+        try {
+          const actual = new URL(await page.getCurrentUrl());
+          const original = new URL(ticket.url);
+          if (actual.origin !== original.origin || actual.pathname !== original.pathname ||
+              actual.searchParams.get("ApplicationId") !== original.searchParams.get("ApplicationId")) return { kind: "unexpected" };
+          const ids = ticket.verifyKeys.map((key) => steps[tab.name].fields[key].id);
+          const read = await readFieldValues(page, ids);
+          const wrong = ticket.verifyKeys.filter((key, position) =>
+            read.values[position] !== expectedFieldValue(tab.name, key, data[tab.name][key]));
+          // Early entry reads at DOM-ready: re-read once the document is complete before concluding.
+          if (wrong.length && !(await documentComplete(page))) return { kind: "pending" };
+          if (wrong.length) {
+            for (const key of wrong) {
+              const position = ticket.verifyKeys.indexOf(key);
+              console.log(`[NZWH] Saved-value mismatch ${tab.name}.${key}: ${savedValueDiagnostic(expectedFieldValue(tab.name, key, data[tab.name][key]), read.values[position])}; section=${steps[tab.name].page}. No applicant values logged.`);
+            }
+            return { kind: "mismatch", fields: wrong.map((key) => `${tab.name}.${key}`), checked: ticket.verifyKeys.length - wrong.length };
+          }
+          ticket.report.persisted.push(...ticket.verifyKeys);
+          return { kind: "ok" };
+        } catch (error) { if (isNavigationError(error)) return { kind: "pending" }; throw error; }
+      },
+      emit,
+      sleep,
+      now: () => Date.now(),
+      aborted: () => execution.getStore()?.signal?.aborted ?? false,
+    });
+    /** Reports one tab's terminal outcome exactly as the sequential path would (events, coverage files, logs). */
+    const applyOutcome = (scheduler: TabScheduler) => async (tab: SectionTab, _finalizing: boolean): Promise<void> => {
+      const { name, outcome } = tab;
+      const ticket = tab.ticket as SavedTicket;
+      if (!outcome) return;
+      const verifyMs = Date.now() - (tab.verifyStartedAt ?? Date.now());
+      if (outcome.kind === "verified") {
+        console.log(`[NZWH] ${name}: saved and verified after reload.`);
+        await emit(keyed(name, { type: "persistence", state: "verified" } as const, true));
+        await completeSection(name, ticket.report, true);
+        logSectionTiming(ticket, verifyMs, null, ` (overlapped ${verifyMs}ms), drain ${scheduler.drainMs}ms`);
+      } else if (outcome.kind === "unverified") {
+        unverifiedSections.push(name);
+        if (outcome.reason === "mismatch") {
+          const fields = outcome.fields ?? [];
+          console.log(`[NZWH] ${new SavedValueVerificationError(fields, outcome.checked ?? 0).message} No repeat SAVE; continuing to the next selected section.`);
+          await emit(keyed(name, {
+            type: "section-result", status: "failed",
+            detail: `Đã nhận phản hồi lưu nhưng các trường chưa khớp: ${fields.join(", ")}. Không tự lưu lại; tiếp tục mục kế tiếp.`,
+            checked: outcome.checked, blocked: fields.length,
+          } as const, true));
+        } else {
+          console.log(`[NZWH] ${new SectionPostbackTimeoutError(name).message} No repeat POST; continuing to the next selected section.`);
+          await emit(keyed(name, {
+            type: "section-result", status: "failed",
+            detail: outcome.reason === "denied"
+              ? "Website chuyển hướng đến trang access-denied; chưa xác minh được việc lưu. Không tự lưu lại; tiếp tục mục kế tiếp."
+              : "Hết thời gian chờ phản hồi trên cùng mục hồ sơ. Chưa xác minh việc lưu; không tự gửi lại. Tiếp tục mục kế tiếp.",
+          } as const, true));
+        }
+      } else if (outcome.kind === "busy") {
+        skippedBusy.push(name);
+        delete saved[name];
+        await writeSaved();
+        await writeFile(join(reportDirectory, "coverage-busy.json"), `${JSON.stringify({ skippedUnverified: skippedBusy }, null, 2)}\n`);
+        await emit(keyed(name, {
+          type: "section-result", status: "failed",
+          detail: "Trang đích bận. Chưa xác minh việc lưu; không tự thử lại. Các mục tiếp theo vẫn được xử lý.",
+        } as const, true));
+        console.log(`[NZWH] ${name}: site returned Please try again later. Save state is unverified; the pipeline will finish the other tabs read-only.`);
+      } else if (!tab.reported) {
+        await emit(keyed(name, { type: "section-result", status: "failed", detail: SECTION_FAILED_DETAIL } as const, true));
+      }
+    };
+    /** Finishes one posted tab read-only (reload + readback) in its own tab, with the sequential error mapping. */
+    const finishReadOnly = async (scheduler: TabScheduler, tab: SectionTab): Promise<void> => {
+      const context = execution.getStore();
+      await scheduler.focus(tab.handle);
+      if (context) context.currentSection = tab.name;
+      try {
+        if (tab.phase === "domready") {
+          await waitWithCaptcha(driver, () => documentComplete(driver), READY_WAIT_MS, FAST_POLL_MS);
+          const flagged = await driver.executeScript<number>(ERROR_LABEL_SCAN_JS);
+          if (flagged) {
+            await emit(keyed(tab.name, { type: "section-result", status: "failed", detail: SECTION_FAILED_DETAIL } as const, false));
+            tab.phase = "done";
+            throw new WorkingHolidayStop(`Server validation flagged ${flagged} fields in ${tab.name} after load; stopped before next section.`);
+          }
+          await emit(keyed(tab.name, { type: "persistence", state: "accepted" } as const, false));
+        }
+        await completeSection(tab.name, await verifySection(driver, tab.ticket as SavedTicket, data, { reload: true }));
+      } catch (error) {
+        if (tab.phase === "done" && error instanceof WorkingHolidayStop) throw error;
+        await mapSectionError(tab.name, error, { recoveredSession: false });
+      }
+      tab.phase = "done";
+    };
+    const runPipeline = async (names: SectionName[], mode: "verify" | "save", barrier: "verified" | "accepted"): Promise<void> => {
+      const context = execution.getStore()!;
+      const main = await driver.getWindowHandle();
+      let scheduler!: TabScheduler;
+      scheduler = new TabScheduler(backgroundOps(), main, { onOutcome: (tab, finalizing) => applyOutcome(scheduler)(tab, finalizing) },
+        { verifyTimeoutMs: READY_WAIT_MS + SECTION_WAIT_MS, pollMs: FAST_POLL_MS, stepMs: 100 });
+      context.pipelineActive = true;
+      context.onChallenge = () => scheduler.noteChallenge();
+      const location = async (handle: string, fn: () => Promise<void>) => {
+        const previous = scheduler.focused;
+        await scheduler.focus(handle);
+        try { await fn(); } finally { await scheduler.focus(previous); }
+      };
+      try {
+        let result: PipelineRunResult;
+        try {
+          result = await runPipelinedSections<SavedTicket>(names, {
+            scheduler, mode, barrier,
+            boundary: (name, prefetch) => sectionBoundary(name, prefetch),
+            begin: async (name) => {
+              context.riskBySection.set(name, false);
+              console.log(`[NZWH] Opening section ${selected.indexOf(name) + 1}/${selected.length}: ${name} (tab pipeline).`);
+              await emit({ type: "section-start", section: name, scenario });
+            },
+            load: (name, handle) => location(handle, async () => {
+              await navigateWithoutWaiting(driver, sectionUrl(name));
+            }),
+            fill: async (name, _tab, ctl) => {
+              context.currentSection = name;
+              await waitForSection(driver, name, entry, ctl.drain);
+              const actual = new URL(await driver.getCurrentUrl());
+              assertHost(actual.href);
+              if (actual.pathname !== `/WorkingHoliday/Wizard/${steps[name].page}` ||
+                  actual.searchParams.get("ApplicationId") !== applicationPage?.searchParams.get("ApplicationId"))
+                throw new WorkingHolidayStop("Conditional page unavailable or application changed.");
+              const ticket = await saveSection(driver, name, data, entry, { interactive: true, beforePost: ctl.beforePost });
+              return ticket;
+            },
+            skip: async (name) => {
+              await emit(keyed(name, { type: "section-result", status: "skipped", detail: SKIPPED_DETAIL } as const, true));
+            },
+            log: (message) => console.log(message),
+          });
+        } catch (error) {
+          if (error instanceof PipelineAbort) {
+            await scheduler.finalizeInFlight((message) => console.log(message));
+            throw new WorkingHolidayStop(`Stopped in ${error.section}. ${reasonOf(error.reason)} Later sections have not run.`);
+          }
+          throw error;
+        }
+        if (!result.downgraded) {
+          // Keep the tab that shows the last section; the submission phase continues there like the sequential run.
+          await scheduler.collapse();
+          context.pipelineActive = false;
+          return;
+        }
+        console.log(`[NZWH] Tab pipeline downgraded to off: ${result.downgraded}.`);
+        await emit({ type: "phase", phase: "recovery", message: DOWNGRADE_PHASE_MESSAGE });
+        // Posted tabs finish read-only in their own tabs, earliest section first; nothing is ever re-sent.
+        for (const tab of scheduler.tabs.filter((candidate) => candidate.phase !== "done")) {
+          if (result.errorPosted && tab.name === result.errorSection) {
+            await scheduler.focus(tab.handle);
+            context.currentSection = tab.name;
+            await mapSectionError(tab.name, result.error, { recoveredSession: false });
+            tab.phase = "done";
+          } else await finishReadOnly(scheduler, tab);
+        }
+        await scheduler.collapse();
+        context.pipelineActive = false;
+        for (const rest of result.remaining) {
+          const carried = result.error !== undefined && !result.errorPosted && rest.name === result.errorSection;
+          await runSection(rest.name, { started: rest.started, ...(carried ? { initialError: result.error } : {}) });
+        }
+      } finally {
+        context.pipelineActive = false;
+        context.onChallenge = undefined;
+        await scheduler.closeExtra();
+      }
+    };
+    const adviserSkipped = (name: SectionName) => name === "adviser" && data.personal.representedByAdviser !== "Yes";
+    const todo = selected.filter((name) => !options.taskKeys || options.taskKeys.includes(`${scenario}:${name}`));
+    let sequentialDone = 0;
+    for (const [position, name] of todo.entries()) {
+      if (pipeline.mode !== "off" && sequentialDone >= 1) {
+        const rest = todo.slice(position).filter((candidate) => !adviserSkipped(candidate));
+        if (rest.length >= 2) {
+          for (const candidate of todo.slice(position)) if (adviserSkipped(candidate))
+            console.log("[NZWH] Adviser skipped: personal.representedByAdviser is No. Use an adviser scenario to fill this section.");
+          await runPipeline(rest, pipeline.mode, pipeline.barrier);
+          break;
+        }
+      }
+      await sectionBoundary(name);
+      console.log(
+        `[NZWH] Opening section ${selected.indexOf(name) + 1}/${selected.length}: ${name}. url=${await driver.getCurrentUrl().then((u) => new URL(u).pathname).catch(() => "?")}`,
+      );
+      if (adviserSkipped(name)) {
+        console.log(
+          "[NZWH] Adviser skipped: personal.representedByAdviser is No. Use an adviser scenario to fill this section.",
+        );
+        await execution.getStore()?.validations.get(name); // a skipped section still honors its boundary validation
+        continue;
+      }
+      await runSection(name);
+      sequentialDone++;
+    }
+  }
+  await checkpoint();
+  console.log(
+    `[NZWH] Sections saved and verified this run: ${completedSections.join(", ") || "none"}.`,
+  );
+  if (skippedBusy.length)
+    console.log(
+      `[NZWH] Incomplete sections skipped because the site was busy: ${skippedBusy.join(", ")}. Re-run these sections later; no successful SAVE is claimed for them.`,
+    );
+  const result = await finishApplication(driver, {
+    mode,
+    payerName: options.payerName,
+    filled: skippedBusy.length === 0 && unverifiedSections.length === 0,
+    origin,
+    applicationId: selectedApplicationId ?? undefined,
+    checkpoint,
+    ready: async () => {
+      // Submit.aspx has an inline CAPTCHA below the declarations. Load its DOM
+      // without waiting for that CAPTCHA, so the Yes labels are selected first.
+      const url = new URL(await driver.getCurrentUrl());
+      if (url.origin === origin && /^\/WorkingHoliday\/Application\/(?:Submit|Declarations?)\.aspx$/i.test(url.pathname)) {
+        await driver.wait(async () => {
+          await checkpoint();
+          return await driver.executeScript("return document.readyState") === "complete";
+        }, 30000);
+        await assertSiteAvailable(driver);
+      } else await ready(driver);
+    },
+    waitForCaptcha: async () => { await captchaGuard(driver); },
+    // Check the transition before entering the next page's CAPTCHA wait.
+    // Eager sessions keep the full-load precondition on submission, declaration and payment pages.
+    waitForChange: submissionWaitForChange(driver, eagerSession),
+    submitting: () => emit({ type: "submission", state: "unconfirmed" }),
+    confirmed: () => emit({ type: "submission", state: "confirmed" }),
+  });
+  console.log(`[NZWH] ${result.message}`);
+  console.log(`[NZWH] Run finished; total ${formatDuration(Date.now() - runStartMs)}.`);
+  return {
+    ...result,
+    driver,
+  };
+}
+
